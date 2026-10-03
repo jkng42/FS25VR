@@ -14,7 +14,7 @@ fs25vr turns Farming Simulator 25 into a real VR game through OpenXR. It works w
 
 ## Requirements
 
-- Farming Simulator 25 on Windows with the **DirectX 12** renderer (the default). Tested with v1.5.0.1.
+- Farming Simulator 25 on Windows with the **DirectX 12** renderer (the default). Tested with v1.20.0.0 (and v1.5.0.1).
 - A PC VR headset and an OpenXR runtime set as active (for example SteamVR's OpenXR setting).
 
 ## Install

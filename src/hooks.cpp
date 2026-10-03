@@ -235,6 +235,24 @@ bool WriteJump(void* target, void* detour)
     return true;
 }
 
+// Since v1.20 the game obtains DXGI through NVIDIA Streamline (sl.interposer.dll) and frame
+// generation libraries, which call the real dxgi.dll themselves, so the import hooks above never
+// see the factory. Patching the real factory's vtable directly catches every swap chain, whichever
+// layer creates it. Runs on a worker thread: creating DXGI objects inside DllMain is unsafe.
+DWORD WINAPI HookRealFactory(void*)
+{
+    IDXGIFactory2* f = nullptr;
+    HRESULT hr = CreateDXGIFactory1(IID_PPV_ARGS(&f));  // our own import, not the game's
+    if (FAILED(hr) || !f) {
+        Log("dxgi: could not create a factory to hook (0x%08x)", hr);
+        return 0;
+    }
+    HookFactory(f);
+    f->Release();
+    Log("dxgi: real factory hooked");
+    return 0;
+}
+
 bool InstallDxgiHooks()
 {
     HMODULE exe = GetModuleHandleW(nullptr);
@@ -243,5 +261,7 @@ bool InstallDxgiHooks()
     bool b = PatchIat(exe, "dxgi.dll", "CreateDXGIFactory2", (void*)Hook_CreateDXGIFactory2,
                       (void**)&o_CreateDXGIFactory2);
     Log("dxgi import hooks: CreateDXGIFactory1=%d CreateDXGIFactory2=%d", a, b);
-    return a || b;
+    HANDLE t = CreateThread(nullptr, 0, HookRealFactory, nullptr, 0, nullptr);
+    if (t) CloseHandle(t);
+    return true;
 }

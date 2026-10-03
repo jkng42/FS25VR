@@ -83,16 +83,33 @@ bool InstallEyeSync()
         Log("eye sync: disabled in fs25vr.ini");
         return false;
     }
-    // RunFrame prologue (15 relocatable bytes) followed by its distinctive body start.
-    BYTE* fn = FindPattern(
-        "48 8B C4 48 89 58 18 48 89 70 20 55 57 41 56 48 8D A8 88 FE FF FF 48 81 EC 60 02 00 00 "
-        "0F 29 70 D8 48 8B 05 ?? ?? ?? ?? 48 33 C4 48 89 85 40 01 00 00 0F 28 F1 48 8B D9 33 F6 "
-        "40 38 B1 95 02 00 00");
-    if (!fn) {
+    // RunFrame is found by its body, which has survived game updates: it keeps dt (xmm1) in xmm6,
+    // keeps 'this' in rbx and first tests a flag at this+0x295. The prologue before it changes
+    // with compiler versions, so it is matched against known forms that can be relocated.
+    BYTE* anchor = FindPattern("0F 28 F1 48 8B D9 33 F6 40 38 B1 95 02 00 00 0F 84");
+    if (!anchor) {
         Log("eye sync: RunFrame not found (game version changed?); eyes will not be synchronised");
         return false;
     }
-    constexpr size_t kPrologue = 15;
+    BYTE* fn = anchor;
+    while (fn > anchor - 0x80 && !(fn[-1] == 0xCC && ((uintptr_t)fn & 15) == 0)) fn--;
+
+    struct Prologue { const char* bytes; size_t len; };
+    static const Prologue kKnown[] = {
+        // mov rax,rsp; mov [rax+18h],rbx; mov [rax+20h],rsi; push rbp; push rdi; push r14  (v1.5)
+        {"\x48\x8B\xC4\x48\x89\x58\x18\x48\x89\x70\x20\x55\x57\x41\x56", 15},
+        // mov [rsp+18h],rbx; push rbp; push rsi; push rdi; push r14; push r15  (v1.20)
+        {"\x48\x89\x5C\x24\x18\x55\x56\x57\x41\x56\x41\x57", 12},
+    };
+    size_t kPrologue = 0;
+    for (const auto& p : kKnown)
+        if (memcmp(fn, p.bytes, p.len) == 0) { kPrologue = p.len; break; }
+    if (kPrologue == 0) {
+        char hex[3 * 24 + 1] = {};
+        for (int i = 0; i < 24; i++) sprintf(hex + i * 3, "%02X ", fn[i]);
+        Log("eye sync: unknown RunFrame prologue (%s); eyes will not be synchronised", hex);
+        return false;
+    }
     BYTE* tramp = (BYTE*)VirtualAlloc(nullptr, 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
     if (!tramp) return false;
     memcpy(tramp, fn, kPrologue);
