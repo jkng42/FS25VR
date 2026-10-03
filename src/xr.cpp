@@ -110,8 +110,9 @@ struct State {
     XrPosef        pairPose[2]{};
     XrFovf         pairFov[2]{};
     bool           pairReady = false;    // a complete pair waits for the compositor
-    XrTime         pairTime = 0;         // display time the pair's first eye was predicted for
-    uint64_t       pairTimeFrame = ~0ull;
+    XrView         pairViews[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};  // the pair's view query
+    XrTime         pairTime = 0;         // display time it was made for
+    uint64_t       pairViewFrame = ~0ull;
     int            readySet = 0;         // staging textures holding it
     XrPosef        readyPose[2]{};
     XrFovf         readyFov[2]{};
@@ -153,7 +154,7 @@ struct State {
 
     // frame rate statistics
     uint64_t       statPresents = 0, statStereo = 0;
-    uint64_t       statPairsAligned = 0;  // pairs whose second eye was re-timed to the first eye's
+    uint64_t       statPairsAligned = 0;  // pairs that straddled a headset frame (shared view query)
     ULONGLONG      statStart = 0;
     // where frame time goes (seconds, summed over the stats window)
     double         tGame = 0, tWait = 0, tSubmit = 0, tPresent = 0;
@@ -1420,7 +1421,7 @@ void LogStats()
             S.compFrames / sec, S.cEyeImages / sec, S.cWait / cn * 1000, S.cBegin / cn * 1000,
             S.cAcquire / cn * 1000, S.cEnd / cn * 1000);
         if (S.statStereo)
-            Log("  stereo pairs straddling a headset frame (eyes re-timed together): %.0f%%",
+            Log("  stereo pairs straddling a headset frame (both eyes from one head pose): %.0f%%",
                 100.0 * S.statPairsAligned / std::max(1.0, S.statStereo / 2.0));
         S.statPairsAligned = 0;
         S.compFrames = 0;
@@ -1491,21 +1492,27 @@ bool GetView(EyeView& out)
     XrViewLocateInfo li{XR_TYPE_VIEW_LOCATE_INFO};
     li.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
     li.displayTime = S.predictedTime + (XrTime)(S.lag + (S.async ? 1 : 0)) * S.predictedPeriod;
-    // Both eyes of a pair are shown together, so both are predicted for the same display time,
-    // like a stereo camera. Otherwise a headset frame starting between the two renders makes the
-    // first eye's pose a whole headset frame older than the second's.
-    if (S.async && IsSecondOfPair(target) && S.pairTimeFrame == target - 1) {
-        if (li.displayTime != S.pairTime) S.statPairsAligned++;
-        li.displayTime = S.pairTime;
-    }
-    S.pairTime = li.displayTime;
-    S.pairTimeFrame = target;
-    li.space = S.local;
-    XrViewState vs{XR_TYPE_VIEW_STATE};
+    // Both eyes of a pair are shown together, so both come from ONE view query, like a stereo
+    // camera: the same display time and the same tracking sample, i.e. exactly one head pose.
+    // Querying per eye gives two slightly different head poses (and, when a headset frame starts
+    // between the two renders, display times a whole headset frame apart); streaming runtimes that
+    // reproject with a single head pose then show the other eye jittering.
     XrView views[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
-    uint32_t n = 0;
-    if (XR_FAILED(xrLocateViews(S.session, &li, &vs, 2, &n, views)) || n != 2) return false;
-    if (!(vs.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT)) return false;
+    if (S.async && IsSecondOfPair(target) && S.pairViewFrame == target - 1) {
+        views[0] = S.pairViews[0];
+        views[1] = S.pairViews[1];
+        if (li.displayTime != S.pairTime) S.statPairsAligned++;
+    } else {
+        li.space = S.local;
+        XrViewState vs{XR_TYPE_VIEW_STATE};
+        uint32_t n = 0;
+        if (XR_FAILED(xrLocateViews(S.session, &li, &vs, 2, &n, views)) || n != 2) return false;
+        if (!(vs.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT)) return false;
+        S.pairViews[0] = views[0];
+        S.pairViews[1] = views[1];
+        S.pairTime = li.displayTime;
+        S.pairViewFrame = target;
+    }
 
     FrameRecord& rec = S.ring[target % kRing];
     rec.frame = target;
