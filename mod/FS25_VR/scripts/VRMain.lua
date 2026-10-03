@@ -37,6 +37,20 @@ VRMod.symmetric = true
 VRMod.SSAO_SAO = 1
 VRMod.forceSAO = false
 
+-- Head position offset, moved with the numpad while held: one per vehicle (in the cab) and one on
+-- foot, saved in modSettings/FS25_VR.xml. Axis 1 = right, 2 = up, 3 = back (camera space).
+VRMod.OFFSET_KEYS = {
+    [Input.KEY_KP_4 or 260] = {1, -1},  -- left
+    [Input.KEY_KP_6 or 262] = {1, 1},   -- right
+    [Input.KEY_KP_9 or 265] = {2, 1},   -- up
+    [Input.KEY_KP_3 or 259] = {2, -1},  -- down
+    [Input.KEY_KP_8 or 264] = {3, -1},  -- forward
+    [Input.KEY_KP_2 or 258] = {3, 1},   -- back
+}
+VRMod.KEY_OFFSET_RESET = Input.KEY_KP_5 or 261
+VRMod.OFFSET_SPEED = 0.15  -- metres per second
+VRMod.OFFSET_LIMIT = 1.0   -- metres per axis
+
 local function log(fmt, ...)
     print(string.format("[FS25_VR] " .. fmt, ...))
 end
@@ -48,6 +62,9 @@ function VRMod:loadMap(name)
     self.messageTime = 0
     self.lastFrame = -1
     self.wasRunning = false
+    self.offsetHeld = {}
+    self.offsetDirty = false
+    self.activeOffsetKey = nil
 
     local ok, api = pcall(setStereoRendering, true)
     if ok and type(api) == "table" and api.getView ~= nil then
@@ -60,6 +77,7 @@ function VRMod:loadMap(name)
     end
 
     self:installHooks()
+    self:loadOffsets()
 
     self.eyeNode = createTransformGroup("vrEye")
     link(getRootNode(), self.eyeNode)
@@ -125,6 +143,9 @@ function VRMod:deleteMap()
     self:restoreFrameLimiter()
     self:restoreSSAO()
     self:updateHud(false)
+    if self.offsetDirty then
+        self:saveOffsets()
+    end
     for cam, _ in pairs(self.cams) do
         self:restoreCamera(cam, true)
     end
@@ -268,10 +289,22 @@ function VRMod:applyEye(cam, anchorFn)
     if not ok then
         return false
     end
-    local anchor = anchorFn(eye, frame)
+    local anchor, offsetKey = anchorFn(eye, frame)
     if anchor == nil then
         return false
     end
+    -- the offset only changes on left-eye frames, so both images of a pair agree
+    self.activeOffsetKey = offsetKey
+    if eye == 0 or offsetKey ~= self.pairOffsetKey then
+        self.pairOffsetKey = offsetKey
+        local o = offsetKey ~= nil and self.offsets[offsetKey] or nil
+        if o ~= nil then
+            self.pairOx, self.pairOy, self.pairOz = o[1], o[2], o[3]
+        else
+            self.pairOx, self.pairOy, self.pairOz = 0, 0, 0
+        end
+    end
+    px, py, pz = px + self.pairOx, py + self.pairOy, pz + self.pairOz
 
     local s = self:getCamState(cam)
     if not s.applied then
@@ -393,7 +426,8 @@ function VRMod:onVehicleCameraUpdated(vcam)
     end
     self:applyEye(cam, function(eye, frame)
         if vcam.isInside then
-            return self:getSeatAnchor(vcam)
+            local file = vcam.vehicle ~= nil and vcam.vehicle.configFileName or "unknown"
+            return self:getSeatAnchor(vcam), "cab:" .. file
         end
         if self:holdWorldAnchor(cam, eye, frame) then
             return self.worldAnchor
@@ -414,17 +448,123 @@ function VRMod:onPlayerCameraUpdated(pc)
         return
     end
     self:applyEye(cam, function(eye, frame)
+        local offsetKey = cam == pc.firstPersonCamera and "foot" or nil
         if self:holdWorldAnchor(cam, eye, frame) then
-            return self.worldAnchor
+            return self.worldAnchor, offsetKey
         end
         if cam == pc.firstPersonCamera and pc.pitchNode ~= nil and pc.yawNode ~= nil then
             -- body anchor: head position without view bobbing, heading from the body yaw
             local x, y, z = getWorldTranslation(pc.pitchNode)
             local dx, _, dz = localDirectionToWorld(pc.yawNode, 0, 0, 1)
-            return self:setWorldAnchor(x, y, z, dx, dz)
+            return self:setWorldAnchor(x, y, z, dx, dz), offsetKey
         end
-        return self:getLevelAnchorForCamera(cam)
+        return self:getLevelAnchorForCamera(cam), offsetKey
     end)
+end
+
+---------------------------------------------------------------------------------------------------
+-- head position offset
+
+local function offsetFile()
+    return getUserProfileAppPath() .. "modSettings/FS25_VR.xml"
+end
+
+function VRMod:loadOffsets()
+    self.offsets = {}
+    local ok, err = pcall(function()
+        local path = offsetFile()
+        if not fileExists(path) then
+            return
+        end
+        local xml = loadXMLFile("fs25vrSettings", path)
+        if xml == nil or xml == 0 then
+            return
+        end
+        local i = 0
+        while true do
+            local key = string.format("fs25vr.offset(%d)", i)
+            local name = getXMLString(xml, key .. "#name")
+            if name == nil then
+                break
+            end
+            self.offsets[name] = {getXMLFloat(xml, key .. "#x") or 0, getXMLFloat(xml, key .. "#y") or 0,
+                getXMLFloat(xml, key .. "#z") or 0}
+            i = i + 1
+        end
+        delete(xml)
+    end)
+    if not ok then
+        log("could not read head offsets: %s", tostring(err))
+    end
+end
+
+function VRMod:saveOffsets()
+    self.offsetDirty = false
+    local ok, err = pcall(function()
+        createFolder(getUserProfileAppPath() .. "modSettings/")
+        local xml = createXMLFile("fs25vrSettings", offsetFile(), "fs25vr")
+        if xml == nil or xml == 0 then
+            return
+        end
+        local names = {}
+        for name, o in pairs(self.offsets) do
+            if o[1] ~= 0 or o[2] ~= 0 or o[3] ~= 0 then
+                table.insert(names, name)
+            end
+        end
+        table.sort(names)
+        for i, name in ipairs(names) do
+            local o = self.offsets[name]
+            local key = string.format("fs25vr.offset(%d)", i - 1)
+            setXMLString(xml, key .. "#name", name)
+            setXMLFloat(xml, key .. "#x", o[1])
+            setXMLFloat(xml, key .. "#y", o[2])
+            setXMLFloat(xml, key .. "#z", o[3])
+        end
+        saveXMLFile(xml)
+        delete(xml)
+    end)
+    if not ok then
+        log("could not save head offsets: %s", tostring(err))
+    end
+end
+
+function VRMod:showOffset(name, quiet)
+    local o = self.offsets[name] or {0, 0, 0}
+    local where = name == "foot" and "on foot" or "this cab"
+    self:showMessage(string.format("Head offset (%s): right %+.2f  up %+.2f  forward %+.2f m",
+        where, o[1], o[2], -o[3]), quiet)
+end
+
+function VRMod:updateOffset(dt)
+    if next(self.offsetHeld) == nil then
+        return
+    end
+    local name = self.activeOffsetKey
+    if name == nil or not self:isStereoAllowed() then
+        -- a menu opened (or an exterior camera): drop the keys so none stays stuck down
+        self.offsetHeld = {}
+        if self.offsetDirty then
+            self:saveOffsets()
+        end
+        if name == nil then
+            self:showMessage("Head offset: only in a cab or on foot", true)
+        end
+        return
+    end
+    local o = self.offsets[name]
+    if o == nil then
+        o = {0, 0, 0}
+        self.offsets[name] = o
+    end
+    local step = VRMod.OFFSET_SPEED * dt / 1000
+    local limit = VRMod.OFFSET_LIMIT
+    for sym, _ in pairs(self.offsetHeld) do
+        local axis = VRMod.OFFSET_KEYS[sym]
+        o[axis[1]] = math.max(-limit, math.min(limit, o[axis[1]] + axis[2] * step))
+    end
+    self.offsetDirty = true
+    self:showOffset(name, true)
 end
 
 ---------------------------------------------------------------------------------------------------
@@ -455,6 +595,7 @@ function VRMod:update(dt)
         self:updateSSAO()
     end
     self:updateHud(running and self:isStereoAllowed())
+    self:updateOffset(dt)
 
     -- leaving stereo (menus, toggle): give the camera its normal projection back
     if not self:isStereoAllowed() then
@@ -496,10 +637,30 @@ function VRMod:draw()
 end
 
 function VRMod:keyEvent(unicode, sym, modifier, isDown)
-    if not isDown or self.api == nil then
+    if self.api == nil then
         return
     end
-    if sym == VRMod.KEY_RECENTER then
+    if VRMod.OFFSET_KEYS[sym] ~= nil then
+        self.offsetHeld[sym] = isDown or nil
+        if next(self.offsetHeld) == nil and self.offsetDirty then
+            self:saveOffsets()
+            if self.activeOffsetKey ~= nil then
+                self:showOffset(self.activeOffsetKey)
+            end
+        end
+        return
+    end
+    if not isDown then
+        return
+    end
+    if sym == VRMod.KEY_OFFSET_RESET then
+        local name = self.activeOffsetKey
+        if name ~= nil and self:isStereoAllowed() then
+            self.offsets[name] = nil
+            self:saveOffsets()
+            self:showOffset(name)
+        end
+    elseif sym == VRMod.KEY_RECENTER then
         self.api.recenter()
         self:showMessage("VR view recentred")
     elseif sym == VRMod.KEY_FRUSTUM and self.api.setSymmetric ~= nil then
@@ -521,8 +682,10 @@ end
 function VRMod:mouseEvent(posX, posY, isDown, isUp, button)
 end
 
-function VRMod:showMessage(text)
-    log("%s", text)
+function VRMod:showMessage(text, quiet)
+    if not quiet then
+        log("%s", text)
+    end
     self.messageText = text
     self.messageTime = 2500
 end

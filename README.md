@@ -42,6 +42,12 @@ To uninstall, double-click **`UNINSTALL.bat`**, or delete `dinput8.dll`, `openxr
 | F10 | HUD on/off in VR (hidden by default) |
 | F6 | Projection: centred (default) / exact off-centre |
 | F7 | Ambient occlusion: game setting (default) / force SAO |
+| Numpad 4 / 6 | Move your head position left / right (hold) |
+| Numpad 8 / 2 | Move your head position forward / back (hold) |
+| Numpad 9 / 3 | Move your head position up / down (hold) |
+| Numpad 5 | Reset the head position offset |
+
+The head position offset is remembered separately for each vehicle's cab and for walking, in `Documents\My Games\FarmingSimulator2025\modSettings\FS25_VR.xml`. Use it to sit higher or further forward in a cab, or to fix your height on foot.
 
 ## Settings (`<game>\x64\fs25vr.ini`)
 
