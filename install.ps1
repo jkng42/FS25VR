@@ -15,6 +15,10 @@
   The bridge logs the ideal size for your headset in x64\fs25vr.log
   ("recommended render size for the centred frustum").
 
+.PARAMETER AutoResolution
+  Like -EyeResolution, but reads the ideal size for your headset from x64\fs25vr.log
+  (written during your first VR session).
+
 .PARAMETER Uninstall
   Removes the bridge and the mod and restores game.xml if it was changed.
 
@@ -29,6 +33,7 @@ param(
     [int]$EyeWidth = 2448,
     [int]$EyeHeight = 2448,
     [switch]$EyeResolution,
+    [switch]$AutoResolution,
     [switch]$Uninstall
 )
 $ErrorActionPreference = "Stop"
@@ -46,6 +51,24 @@ function Find-GameDir {
         }
         $candidates += $libs | ForEach-Object { Join-Path $_ "steamapps\common\Farming Simulator 25" }
     } catch { }
+    # installed-programs list (standalone / GIANTS store / other installers)
+    foreach ($key in "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
+                     "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*",
+                     "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*") {
+        Get-ItemProperty $key -ErrorAction SilentlyContinue |
+            Where-Object { $_.DisplayName -match "Farming Simulator (25|2025)" -and $_.InstallLocation } |
+            ForEach-Object { $candidates += $_.InstallLocation }
+    }
+    # Epic Games Store
+    $epic = Join-Path $env:ProgramData "Epic\EpicGamesLauncher\Data\Manifests"
+    if (Test-Path $epic) {
+        Get-ChildItem $epic -Filter *.item -ErrorAction SilentlyContinue | ForEach-Object {
+            try {
+                $m = Get-Content $_.FullName -Raw | ConvertFrom-Json
+                if ($m.DisplayName -match "Farming Simulator 25") { $candidates += $m.InstallLocation }
+            } catch { }
+        }
+    }
     $candidates += "C:\Program Files (x86)\Farming Simulator 2025", "C:\Program Files\Farming Simulator 2025"
     foreach ($c in $candidates) {
         if (Test-Path (Join-Path $c "x64\FarmingSimulator2025Game.exe")) { return $c }
@@ -53,11 +76,23 @@ function Find-GameDir {
     return $null
 }
 
+function Test-GameDir($dir) { return $dir -and (Test-Path (Join-Path $dir "x64\FarmingSimulator2025Game.exe")) }
+
 if (-not $GameDir) { $GameDir = Find-GameDir }
-if (-not $GameDir -or -not (Test-Path (Join-Path $GameDir "x64\FarmingSimulator2025Game.exe"))) {
-    throw "Farming Simulator 25 not found. Pass the install folder: install.ps1 -GameDir 'D:\Games\Farming Simulator 25'"
+while (-not (Test-GameDir $GameDir)) {
+    if ($GameDir) { Write-Host "Farming Simulator 25 was not found in: $GameDir" }
+    else { Write-Host "Could not find Farming Simulator 25 automatically." }
+    Write-Host "Paste the game's install folder (the one that contains FarmingSimulator2025.exe)"
+    Write-Host "and press Enter, or just press Enter to cancel:"
+    $answer = Read-Host
+    if ($null -eq $answer -or -not $answer.Trim()) { throw "Cancelled - nothing was installed." }
+    $GameDir = $answer.Trim().Trim('"')
 }
 $x64 = Join-Path $GameDir "x64"
+
+if (Get-Process FarmingSimulator2025Game, FarmingSimulator2025 -ErrorAction SilentlyContinue) {
+    throw "Farming Simulator 25 is running. Close the game first, then try again."
+}
 
 $mods = Join-Path $ProfileDir "mods"
 $settingsXml = Join-Path $ProfileDir "gameSettings.xml"
@@ -115,6 +150,18 @@ if ($release) {
     } finally {
         $archive.Dispose()
     }
+}
+
+if ($AutoResolution) {
+    $log = Join-Path $x64 "fs25vr.log"
+    $m = if (Test-Path $log) { Select-String -Path $log -Pattern 'recommended render size for the centred frustum: (\d+)x(\d+)' | Select-Object -Last 1 }
+    if (-not $m) {
+        throw "No recommended size yet. Play once in VR (load a savegame with the headset on), quit the game, then run this again."
+    }
+    $EyeWidth = [int]$m.Matches[0].Groups[1].Value
+    $EyeHeight = [int]$m.Matches[0].Groups[2].Value
+    $EyeResolution = $true
+    Write-Host "Recommended size for your headset: ${EyeWidth}x${EyeHeight}"
 }
 
 if ($EyeResolution) {

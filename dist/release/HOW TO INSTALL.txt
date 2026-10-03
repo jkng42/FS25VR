@@ -1,0 +1,60 @@
+==============================================================
+  fs25vr - VR for Farming Simulator 25          HOW TO INSTALL
+==============================================================
+Unofficial mod - not made by or affiliated with GIANTS Software.
+Free and open source: https://github.com/nick10180/FS25VR
+
+WHAT YOU NEED
+  - Farming Simulator 25 on a Windows PC
+  - A PC VR headset (Valve Index, Vive, Quest via Link/Air Link or
+    Virtual Desktop, Pico, Windows Mixed Reality ...)
+  - SteamVR (or your headset's own PC software) set as the
+    "OpenXR runtime". In SteamVR: Settings > OpenXR > "Set SteamVR
+    as OpenXR runtime".
+
+INSTALL (2 minutes)
+  1. Close the game.
+  2. Double-click  INSTALL.bat
+     - If Windows shows "Windows protected your PC", click
+       "More info" and then "Run anyway".
+     - If it can't find the game, it asks you for the game folder.
+       Paste it in (e.g.  D:\SteamLibrary\steamapps\common\Farming Simulator 25)
+       and press Enter.
+  3. Put your headset on (or have it ready) and start the game.
+  4. Load your savegame. In the mod list, make sure
+     "VR (OpenXR, stereoscopic 6DOF)" is ticked.
+  5. You should see "VR active". Press F8 to recentre your view.
+
+FOR THE SHARPEST PICTURE (do this once, after step 5)
+  6. Quit the game.
+  7. Double-click  SET VR RESOLUTION.bat
+  8. Start the game again.
+
+IN THE GAME'S GRAPHICS OPTIONS, PLEASE TURN OFF
+  - Frame generation (FSR 3 frame generation)
+  - DLSS / DSR
+  - Motion blur
+  These cause doubled or blurry images in VR.
+
+KEYS
+  F8   Recentre the view (sit or stand normally first)
+  F9   VR camera on / off
+  F10  Show / hide the HUD in VR (hidden by default)
+  F6   Projection mode (leave on "centred" unless told otherwise)
+  F7   Ambient occlusion mode
+
+MENUS, MAP AND SHOP
+  These appear on a big flat screen in front of you. Use the mouse
+  as normal - a pointer is shown in the headset.
+
+UNINSTALL
+  Double-click  UNINSTALL.bat  (or delete dinput8.dll,
+  openxr_loader.dll and fs25vr.ini from the game's x64 folder).
+
+SOMETHING WRONG?
+  - Everything is a flat screen: the VR mod isn't ticked for that
+    savegame, or you're in a menu.
+  - Stutters: lower the game's graphics settings. VR needs a high
+    frame rate (ideally above your headset's refresh rate).
+  - Send the file  <game folder>\x64\fs25vr.log  with your bug
+    report: https://github.com/nick10180/FS25VR/issues
