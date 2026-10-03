@@ -36,6 +36,7 @@ void LoadConfig()
     g_config.asyncSubmit  = ReadInt(f, L"asyncSubmit", 1) != 0;
     g_config.profile      = ReadInt(f, L"profile", 0) != 0;
     g_config.forceRender  = ReadInt(f, L"forceRender", 0) != 0;
+    g_config.deferPatches = ReadInt(f, L"deferPatches", 0) != 0;
     g_config.debugLog     = ReadInt(f, L"debugLog", 0) != 0;
     if (g_config.worldScale <= 0.01f) g_config.worldScale = 1.0f;
 

@@ -77,10 +77,14 @@ BYTE* FindPattern(const char* pattern)
 
 } // namespace
 
-bool InstallEyeSync()
+bool InstallEyeSync(bool final)
 {
+    static bool done = false, disabledLogged = false;
+    if (done) return true;
+    if (!final && g_config.deferPatches) return false;
     if (!g_config.syncEyes) {
-        Log("eye sync: disabled in fs25vr.ini");
+        if (!disabledLogged) Log("eye sync: disabled in fs25vr.ini");
+        disabledLogged = true;
         return false;
     }
     // RunFrame is found by its body, which has survived game updates: it keeps dt (xmm1) in xmm6,
@@ -89,7 +93,7 @@ bool InstallEyeSync()
     BYTE* anchor = FindPattern("0F 28 F1 48 8B D9 33 F6 40 38 B1 95 02 00 00 0F 84");
     if (!anchor) anchor = FindPattern("0F 28 F1 48 8B D9 33 F6 40 38 B1 ?? ?? 00 00 0F 84");  // flag moved
     if (!anchor) {
-        Log("eye sync: RunFrame not found (game version changed?); eyes will not be synchronised");
+        if (final) Log("eye sync: RunFrame not found (game version changed?); eyes will not be synchronised");
         return false;
     }
     BYTE* fn = anchor;
@@ -127,5 +131,6 @@ bool InstallEyeSync()
     bool ok = WriteJump(fn, (void*)Hook_RunFrame);
     Log("eye sync: RunFrame at exe+%llx hooked %s", (unsigned long long)(fn - (BYTE*)GetModuleHandleW(nullptr)),
         ok ? "ok" : "FAILED");
+    done = ok;
     return ok;
 }

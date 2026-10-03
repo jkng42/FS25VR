@@ -16,6 +16,7 @@ struct Config {
     bool  asyncSubmit     = true;   // headset frame loop on its own thread; the game never waits for it
     bool  profile         = false;  // GPU timestamps + per-frame CSV
     bool  forceRender     = false;  // debug: do the full VR copy even when the headset is idle
+    bool  deferPatches    = false;  // debug: skip the load-time engine scan (simulates a DRM-wrapped exe)
     bool  debugLog        = false;  // verbose per-frame logging
 };
 

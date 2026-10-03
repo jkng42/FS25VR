@@ -283,9 +283,10 @@ bool PatchIat(const char* dll, const char* func, void* hook, void** original)
             auto ibn = (IMAGE_IMPORT_BY_NAME*)(base + names->u1.AddressOfData);
             if (strcmp((char*)ibn->Name, func) != 0) continue;
             void** slot = (void**)&addrs->u1.Function;
+            if (*slot == hook) return true;  // already hooked (safe to call again)
             DWORD old;
             VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &old);
-            *original = *slot;
+            if (!*original) *original = *slot;  // keep the first original if re-applied
             *slot = hook;
             VirtualProtect(slot, sizeof(void*), old, &old);
             return true;

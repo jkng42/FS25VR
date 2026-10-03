@@ -3,6 +3,8 @@
 #include "log.h"
 #include "xr.h"
 #include "window.h"
+#include "game.h"
+#include "sync.h"
 
 #include <windows.h>
 #include <d3d12.h>
@@ -142,11 +144,25 @@ void HookSwapChain(IUnknown* queueOrDevice, IUnknown* swapUnk)
     sc->Release();
 }
 
+// Second chance for everything that needs the game's code: by the time the game creates its swap
+// chain its own startup has run, so a DRM wrapper has decrypted the code and rebuilt the import
+// table. The Lua mod and vehicles load much later, so nothing that depends on these is missed.
+void LateGameInit()
+{
+    static bool done = false;
+    if (done) return;
+    done = true;
+    InstallGamePatches(true);
+    InstallEyeSync(true);
+    InstallWindowHooks();  // re-applies import hooks a wrapper may have overwritten
+}
+
 HRESULT STDMETHODCALLTYPE Hook_CreateSwapChainForHwnd(IDXGIFactory2* self, IUnknown* device, HWND hwnd,
                                                       const DXGI_SWAP_CHAIN_DESC1* desc,
                                                       const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* fs,
                                                       IDXGIOutput* output, IDXGISwapChain1** out)
 {
+    LateGameInit();
     DXGI_SWAP_CHAIN_DESC1 d = *desc;
     d.BufferUsage |= DXGI_USAGE_SHADER_INPUT;  // we sample the backbuffer
     if (g_config.fitWindow) d.Scaling = DXGI_SCALING_STRETCH;  // window may be smaller than the render size
@@ -169,6 +185,7 @@ HRESULT STDMETHODCALLTYPE Hook_CreateSwapChainForHwnd(IDXGIFactory2* self, IUnkn
 HRESULT STDMETHODCALLTYPE Hook_CreateSwapChain(IDXGIFactory* self, IUnknown* device, DXGI_SWAP_CHAIN_DESC* desc,
                                                IDXGISwapChain** out)
 {
+    LateGameInit();
     if (desc) desc->BufferUsage |= DXGI_USAGE_SHADER_INPUT;
     HRESULT hr = o_CreateSwapChain(self, device, desc, out);
     if (SUCCEEDED(hr) && out && *out) HookSwapChain(device, *out);

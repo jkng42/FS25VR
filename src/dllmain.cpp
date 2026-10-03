@@ -19,10 +19,10 @@ static void Startup(HMODULE self)
         Log("disabled in fs25vr.ini; acting as a plain dinput8 proxy");
         return;
     }
-    if (!InstallGamePatches()) Log("game patches failed: the Lua mod will report VR as unavailable");
+    InstallGamePatches(false);  // retried once the game runs (see hooks.cpp LateGameInit)
     if (!InstallDxgiHooks()) Log("dxgi hooks failed: no VR output");
     InstallWindowHooks();
-    InstallEyeSync();
+    InstallEyeSync(false);
 }
 
 BOOL WINAPI DllMain(HMODULE module, DWORD reason, LPVOID)

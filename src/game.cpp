@@ -1,4 +1,5 @@
 #include "game.h"
+#include "config.h"
 #include "hooks.h"
 #include "log.h"
 #include "xr.h"
@@ -156,8 +157,11 @@ struct Section { BYTE* start; size_t size; bool code; };
 std::vector<Section> g_sections;
 Section g_text{};
 
+bool g_drmWrapper = false;  // exe carries Steam's DRM wrapper (".bind" section)
+
 bool FindSections()
 {
+    if (g_text.start) return true;
     auto base = (BYTE*)GetModuleHandleW(nullptr);
     auto nt = (IMAGE_NT_HEADERS*)(base + ((IMAGE_DOS_HEADER*)base)->e_lfanew);
     auto sec = IMAGE_FIRST_SECTION(nt);
@@ -166,6 +170,7 @@ bool FindSections()
                   (sec->Characteristics & IMAGE_SCN_MEM_EXECUTE) != 0};
         g_sections.push_back(s);
         if (memcmp(sec->Name, ".text", 5) == 0) g_text = s;
+        if (memcmp(sec->Name, ".bind", 5) == 0) g_drmWrapper = true;
     }
     return g_text.start != nullptr;
 }
@@ -216,12 +221,12 @@ BYTE* Rel32(BYTE* insn, int dispOffset, int insnLen)
 //   mov rcx, [rbx+10h] ; lea r8, [name] ; mov edx, LUA_GLOBALSINDEX ; call lua_setfield
 struct Binding { BYTE* wrapper = nullptr; BYTE* pushcclosurek = nullptr; BYTE* setfield = nullptr; };
 
-Binding FindBinding(const char* name)
+Binding FindBinding(const char* name, bool diagnose)
 {
     Binding b;
     BYTE* str = FindString(name);
     if (!str) {
-        Log("binding '%s': name string not found", name);
+        if (diagnose) Log("binding '%s': name string not found", name);
         return b;
     }
     for (BYTE* p = g_text.start; p + 24 < g_text.start + g_text.size; p++) {
@@ -252,6 +257,7 @@ Binding FindBinding(const char* name)
         }
         b = Binding{};
     }
+    if (!diagnose) return b;
     Log("binding '%s': registration site not found; code around each use of the name:", name);
     // Diagnostics for unsupported game builds: every rip-relative lea that references the name,
     // with the surrounding instruction bytes, so support can be added from a log file.
@@ -292,17 +298,32 @@ void LogGameBuild()
 
 } // namespace
 
-bool InstallGamePatches()
+bool InstallGamePatches(bool final)
 {
-    LogGameBuild();
+    static bool done = false, logged = false;
+    if (done) return true;
+    if (!logged) {
+        logged = true;
+        LogGameBuild();
+    }
     if (!FindSections()) {
         Log("game: .text not found");
         return false;
     }
+    // Steam's DRM wrapper keeps the game code encrypted until the game itself starts running,
+    // so at load time there is nothing to find yet: try again once the game has started.
+    if (!final && (g_drmWrapper || g_config.deferPatches)) {
+        Log("game: exe uses Steam's DRM wrapper; engine patches are applied once the game has started");
+        return false;
+    }
 
-    Binding stereo = FindBinding("setStereoRendering");
-    Binding headTracking = FindBinding("isHeadTrackingAvailable");
-    if (!stereo.wrapper || !headTracking.wrapper) return false;
+    Binding stereo = FindBinding("setStereoRendering", final);
+    Binding headTracking = FindBinding("isHeadTrackingAvailable", final);
+    if (!stereo.wrapper || !headTracking.wrapper) {
+        if (!final) Log("game: engine functions not found yet; trying again once the game has started");
+        else Log("game patches failed: the Lua mod will report VR as unavailable");
+        return false;
+    }
     if (stereo.pushcclosurek != headTracking.pushcclosurek || stereo.setfield != headTracking.setfield) {
         Log("game: registration sites disagree, refusing to patch");
         return false;
@@ -328,5 +349,6 @@ bool InstallGamePatches()
     bool ok = WriteJump(stereo.wrapper, (void*)Hook_setStereoRendering) &&
               WriteJump(headTracking.wrapper, (void*)Hook_isHeadTrackingAvailable);
     Log("game: binding patches %s", ok ? "installed" : "FAILED");
+    done = ok;
     return ok;
 }
