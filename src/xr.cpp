@@ -45,6 +45,8 @@ struct Chain {
 
 struct State {
     std::recursive_mutex mtx;
+    std::mutex           chainMtx;  // swapchain acquire/release (game thread) vs xrEndFrame (compositor)
+    uint64_t             chainGen = 0;  // bumped (under chainMtx) whenever swapchains are destroyed
 
     ID3D12Device*        device = nullptr;
     ID3D12CommandQueue*  queue = nullptr;
@@ -116,6 +118,7 @@ struct State {
     ULONGLONG      statStart = 0;
     // where frame time goes (seconds, summed over the stats window)
     double         tGame = 0, tWait = 0, tSubmit = 0, tPresent = 0;
+    double         tLockWait = 0;   // game thread time spent waiting for this state lock
     LARGE_INTEGER  tFrameStart{}, tPresentStart{};
     prof::CpuFrame cur;            // this frame's numbers for the profiler
     uint64_t       curFrame = 0;
@@ -234,6 +237,8 @@ void WaitGpuIdle()
 void DestroySwapchains()
 {
     WaitGpuIdle();
+    std::lock_guard<std::mutex> chains(S.chainMtx);  // never while the compositor submits them
+    S.chainGen++;
     DestroyChain(S.eyes[0]);
     DestroyChain(S.eyes[1]);
     DestroyChain(S.quad);
@@ -642,6 +647,7 @@ void RecordMirror(ID3D12Resource* bb, Mirror mode)
 bool CopyToChain(Chain& chain, ID3D12Resource* bb, DXGI_FORMAT bbFormat, bool sampleMarker = false,
                  Mirror mirror = Mirror::None, const CursorDraw* cursor = nullptr)
 {
+    std::lock_guard<std::mutex> chains(S.chainMtx);  // vs. the compositor's xrEndFrame
     uint32_t idx = 0;
     XrSwapchainImageAcquireInfo ai{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
     if (XR_FAILED(xrAcquireSwapchainImage(chain.handle, &ai, &idx))) return false;
@@ -878,8 +884,10 @@ void OnPresentImpl(IDXGISwapChain* swap, LARGE_INTEGER onPresentStart);
 
 void OnPresent(IDXGISwapChain* swap)
 {
+    LARGE_INTEGER lockStart = Now();
     std::lock_guard<std::recursive_mutex> lock(S.mtx);
     LARGE_INTEGER onPresentStart = Now();
+    S.tLockWait += Seconds(lockStart, onPresentStart);
     S.cur = prof::CpuFrame{};
     S.curFrame = S.presentCount;
     UpdateMouseClip();
@@ -990,23 +998,121 @@ void SubmitFrame()
     S.compFrames++;
 }
 
+// Async mode, one headset frame. The OpenXR frame calls (which can block for most of a headset
+// frame inside the runtime) are made WITHOUT the state lock: the game thread takes that lock
+// several times per frame (Present, eye-pose queries from Lua) and must never queue behind the
+// runtime. Only the frame data is copied under the lock; swapchain access is serialised with the
+// game thread's copies by the small chain lock.
+void CompositorFrame()
+{
+    XrSession session;
+    XrSpace local, view;
+    bool wantRecenter;
+    {
+        std::lock_guard<std::recursive_mutex> lock(S.mtx);
+        if (!S.running) return;
+        session = S.session;
+        local = S.local;
+        view = S.view;
+        wantRecenter = S.recenterPending;
+    }
+
+    XrFrameWaitInfo wi{XR_TYPE_FRAME_WAIT_INFO};
+    XrFrameState fs{XR_TYPE_FRAME_STATE};
+    LARGE_INTEGER w0 = Now();
+    XrResult r = xrWaitFrame(session, &wi, &fs);
+    LARGE_INTEGER w1 = Now();
+    if (XR_FAILED(r)) {
+        Log("xrWaitFrame failed %d", r);
+        Sleep(5);
+        return;
+    }
+    XrFrameBeginInfo bi{XR_TYPE_FRAME_BEGIN_INFO};
+    r = xrBeginFrame(session, &bi);
+    if (XR_FAILED(r)) {
+        Log("xrBeginFrame failed %d", r);
+        return;
+    }
+    XrSpaceLocation loc{XR_TYPE_SPACE_LOCATION};
+    bool recentred = wantRecenter && XR_SUCCEEDED(xrLocateSpace(view, local, fs.predictedDisplayTime, &loc)) &&
+                     (loc.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT) &&
+                     (loc.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT);
+
+    // snapshot the newest images and their render poses
+    XrCompositionLayerProjection proj{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
+    XrCompositionLayerProjectionView pv[2] = {{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW},
+                                              {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW}};
+    XrCompositionLayerQuad quad{XR_TYPE_COMPOSITION_LAYER_QUAD};
+    XrCompositionLayerBaseHeader* layers[1];
+    uint32_t layerCount = 0;
+    uint64_t gen;
+    {
+        std::lock_guard<std::recursive_mutex> lock(S.mtx);
+        gen = S.chainGen;
+        S.predictedTime = fs.predictedDisplayTime;
+        S.predictedPeriod = fs.predictedDisplayPeriod;
+        S.shouldRender = fs.shouldRender == XR_TRUE;
+        S.tWait += Seconds(w0, w1);
+        S.compFrames++;
+        if (recentred) {
+            S.recenter = YawOnly(loc.pose);
+            S.recenterPending = false;
+            Log("recentred at (%.2f %.2f %.2f)", S.recenter.position.x, S.recenter.position.y, S.recenter.position.z);
+        }
+        if (S.shouldRender || g_config.forceRender) {
+            if (S.showStereo && S.eyeValid[0] && S.eyeValid[1]) {
+                for (int e = 0; e < 2; e++) {
+                    pv[e].pose = S.eyePose[e];
+                    pv[e].fov = S.eyeFov[e];
+                    pv[e].subImage.swapchain = S.eyes[e].handle;
+                    pv[e].subImage.imageRect = {{0, 0}, {(int32_t)S.eyes[e].w, (int32_t)S.eyes[e].h}};
+                }
+                proj.space = local;
+                proj.viewCount = 2;
+                proj.views = pv;
+                layers[layerCount++] = (XrCompositionLayerBaseHeader*)&proj;
+            } else if (!S.showStereo && S.quadValid && S.quad.handle) {
+                XrPosef offset{{0, 0, 0, 1}, {0, 0, -g_config.menuDistance}};
+                quad.space = local;
+                quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+                quad.subImage.swapchain = S.quad.handle;
+                quad.subImage.imageRect = {{0, 0}, {(int32_t)S.quad.w, (int32_t)S.quad.h}};
+                quad.pose = PoseCompose(S.recenter, offset);
+                quad.size = {g_config.menuWidth, g_config.menuWidth * (float)S.quad.h / (float)S.quad.w};
+                layers[layerCount++] = (XrCompositionLayerBaseHeader*)&quad;
+            }
+        }
+    }
+
+    XrFrameEndInfo fe{XR_TYPE_FRAME_END_INFO};
+    fe.displayTime = fs.predictedDisplayTime;
+    fe.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+    std::lock_guard<std::mutex> chains(S.chainMtx);
+    fe.layerCount = gen == S.chainGen ? layerCount : 0;  // swapchains rebuilt since the snapshot
+    fe.layers = layers;
+    r = xrEndFrame(session, &fe);
+    if (XR_FAILED(r)) Log("xrEndFrame failed %d", r);
+}
+
 // Async mode: the OpenXR frame loop runs here at the headset's rate, independent of the game.
 void CompositorLoop()
 {
     Log("compositor thread started");
-    std::unique_lock<std::recursive_mutex> lock(S.mtx);
     while (S.compRun) {
-        PollEvents();
-        if (!S.session) break;
-        if (!S.running) {
-            lock.unlock();
+        bool running;
+        {
+            std::lock_guard<std::recursive_mutex> lock(S.mtx);
+            PollEvents();
+            if (!S.session) break;
+            running = S.running;
+        }
+        if (!running) {
             Sleep(10);
-            lock.lock();
             continue;
         }
-        BeginFrame();  // releases the lock while xrWaitFrame blocks
-        if (S.frameBegun) SubmitFrame();
+        CompositorFrame();
     }
+    std::lock_guard<std::recursive_mutex> lock(S.mtx);
     S.compAlive = false;
     Log("compositor thread stopped");
 }
@@ -1053,6 +1159,7 @@ void LogStats()
     Log("  per frame CPU: game %.1f ms, VR submit %.1f ms, Present %.1f ms, waiting for headset %.1f ms%s",
         S.tGame / n * 1000, S.tSubmit / n * 1000, S.tPresent / n * 1000, S.async ? 0.0 : S.tWait / n * 1000,
         S.async ? " (async: headset paced separately)" : "");
+    Log("  lock waits on the game thread: %.2f ms per frame", S.tLockWait / n * 1000);
     if (S.async) {
         Log("  compositor: %.1f headset frames/s", S.compFrames / sec);
         S.compFrames = 0;
@@ -1063,13 +1170,15 @@ void LogStats()
             g.gpuFrame, g.gpuFrameL, g.gpuFrameR, g.gpuVr, g.runFrameL, g.runFrameR);
     }
     S.statPresents = S.statStereo = 0;
-    S.tGame = S.tWait = S.tSubmit = S.tPresent = 0;
+    S.tGame = S.tWait = S.tSubmit = S.tPresent = S.tLockWait = 0;
     S.statStart = now;
 }
 
 void OnPostPresent()
 {
+    LARGE_INTEGER lockStart = Now();
     std::lock_guard<std::recursive_mutex> lock(S.mtx);
+    S.tLockWait += Seconds(lockStart, Now());
     if (S.tPresentStart.QuadPart) {
         S.cur.present = Seconds(S.tPresentStart, Now());
         S.tPresent += S.cur.present;
@@ -1105,7 +1214,9 @@ bool IsRunning()
 
 bool GetView(EyeView& out)
 {
+    LARGE_INTEGER lockStart = Now();
     std::lock_guard<std::recursive_mutex> lock(S.mtx);
+    S.tLockWait += Seconds(lockStart, Now());
     if (!S.running || S.bbW == 0) return false;
     uint64_t target = S.presentCount + (uint64_t)S.lag;
     if (S.cachedFrame == target) {
