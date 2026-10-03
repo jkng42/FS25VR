@@ -7,6 +7,13 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 set(OPENXR_DIR ${CMAKE_SOURCE_DIR}/third_party/openxr)
 
+# The release version comes from the mod's modDesc.xml, so the log always names the version.
+set(MODDESC ${CMAKE_SOURCE_DIR}/mod/FS25_VR/modDesc.xml)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${MODDESC})
+file(READ ${MODDESC} MODDESC_TEXT)
+string(REGEX MATCH "<version>([^<]+)</version>" _ "${MODDESC_TEXT}")
+set(FS25VR_VERSION "${CMAKE_MATCH_1}")
+
 add_library(dinput8 SHARED
     src/dllmain.cpp
     src/proxy.cpp
@@ -25,7 +32,8 @@ add_library(dinput8 SHARED
 target_include_directories(dinput8 PRIVATE ${OPENXR_DIR}/include src)
 target_compile_definitions(dinput8 PRIVATE
     WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS
-    XR_USE_PLATFORM_WIN32 XR_USE_GRAPHICS_API_D3D12)
+    XR_USE_PLATFORM_WIN32 XR_USE_GRAPHICS_API_D3D12
+    FS25VR_VERSION="${FS25VR_VERSION}")
 target_compile_options(dinput8 PRIVATE /W3 /EHsc /Zi)
 target_link_options(dinput8 PRIVATE /DEBUG /OPT:REF)
 target_link_libraries(dinput8 PRIVATE

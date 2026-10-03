@@ -110,6 +110,8 @@ struct State {
     XrPosef        pairPose[2]{};
     XrFovf         pairFov[2]{};
     bool           pairReady = false;    // a complete pair waits for the compositor
+    XrTime         pairTime = 0;         // display time the pair's first eye was predicted for
+    uint64_t       pairTimeFrame = ~0ull;
     int            readySet = 0;         // staging textures holding it
     XrPosef        readyPose[2]{};
     XrFovf         readyFov[2]{};
@@ -151,6 +153,7 @@ struct State {
 
     // frame rate statistics
     uint64_t       statPresents = 0, statStereo = 0;
+    uint64_t       statPairsAligned = 0;  // pairs whose second eye was re-timed to the first eye's
     ULONGLONG      statStart = 0;
     // where frame time goes (seconds, summed over the stats window)
     double         tGame = 0, tWait = 0, tSubmit = 0, tPresent = 0;
@@ -1413,6 +1416,10 @@ void LogStats()
             "begin %.2f ms, image acquire %.2f ms, end %.2f ms",
             S.compFrames / sec, S.cEyeImages / sec, S.cWait / cn * 1000, S.cBegin / cn * 1000,
             S.cAcquire / cn * 1000, S.cEnd / cn * 1000);
+        if (S.statStereo)
+            Log("  stereo pairs straddling a headset frame (eyes re-timed together): %.0f%%",
+                100.0 * S.statPairsAligned / std::max(1.0, S.statStereo / 2.0));
+        S.statPairsAligned = 0;
         S.compFrames = 0;
         S.cWait = S.cBegin = S.cAcquire = S.cEnd = 0;
         S.cEyeImages = 0;
@@ -1477,9 +1484,20 @@ bool GetView(EyeView& out)
         return true;
     }
 
+    int eye = (int)(target & 1);
     XrViewLocateInfo li{XR_TYPE_VIEW_LOCATE_INFO};
     li.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
     li.displayTime = S.predictedTime + (XrTime)(S.lag + (S.async ? 1 : 0)) * S.predictedPeriod;
+    // Both eyes of a pair are shown together, so both are predicted for the same display time,
+    // like a stereo camera. Otherwise a headset frame starting between the two renders makes the
+    // first eye's pose a whole headset frame older than the second's.
+    const int closer = 1 ^ (g_config.syncPhase & 1);
+    if (S.async && eye == closer && S.pairTimeFrame == target - 1) {
+        if (li.displayTime != S.pairTime) S.statPairsAligned++;
+        li.displayTime = S.pairTime;
+    }
+    S.pairTime = li.displayTime;
+    S.pairTimeFrame = target;
     li.space = S.local;
     XrViewState vs{XR_TYPE_VIEW_STATE};
     XrView views[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
@@ -1487,7 +1505,6 @@ bool GetView(EyeView& out)
     if (XR_FAILED(xrLocateViews(S.session, &li, &vs, 2, &n, views)) || n != 2) return false;
     if (!(vs.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT)) return false;
 
-    int eye = (int)(target & 1);
     FrameRecord& rec = S.ring[target % kRing];
     rec.frame = target;
     rec.eye = eye;

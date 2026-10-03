@@ -13,7 +13,7 @@ static void Startup(HMODULE self)
     std::wstring dir = path;
     dir = dir.substr(0, dir.find_last_of(L"\\/") + 1);
     LogInit(dir);
-    Log("fs25vr " __DATE__ " " __TIME__);
+    Log("fs25vr " FS25VR_VERSION);
     LoadConfig();
     if (!g_config.enabled) {
         Log("disabled in fs25vr.ini; acting as a plain dinput8 proxy");
