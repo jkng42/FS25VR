@@ -224,10 +224,15 @@ Binding FindBinding(const char* name)
         Log("binding '%s': name string not found", name);
         return b;
     }
-    for (BYTE* p = g_text.start; p + 12 < g_text.start + g_text.size; p++) {
+    for (BYTE* p = g_text.start; p + 24 < g_text.start + g_text.size; p++) {
         if (!(p[0] == 0x4C && p[1] == 0x8D && p[2] == 0x05)) continue;  // lea r8, [rip+disp32]
-        if (Rel32(p, 3, 7) != str || p[7] != 0xE8) continue;           // followed by call
-        BYTE* closure = Rel32(p + 7, 1, 5);
+        if (Rel32(p, 3, 7) != str) continue;
+        // the call to lua_pushcclosurek follows, allowing a few register moves in between
+        BYTE* call = nullptr;
+        for (BYTE* q = p + 7; q < p + 20; q++)
+            if (*q == 0xE8 && InText(Rel32(q, 1, 5))) { call = q; break; }
+        if (!call) continue;
+        BYTE* closure = Rel32(call, 1, 5);
         // closest preceding rip-relative lea into .text = the wrapper function
         for (BYTE* q = p - 7; q > p - 40; q--) {
             if ((q[0] == 0x48 || q[0] == 0x4C) && q[1] == 0x8D && (q[2] & 0xC7) == 0x05) {
@@ -247,14 +252,49 @@ Binding FindBinding(const char* name)
         }
         b = Binding{};
     }
-    Log("binding '%s': registration site not found", name);
+    Log("binding '%s': registration site not found; code around each use of the name:", name);
+    // Diagnostics for unsupported game builds: every rip-relative lea that references the name,
+    // with the surrounding instruction bytes, so support can be added from a log file.
+    int uses = 0;
+    for (BYTE* p = g_text.start + 48; p + 64 < g_text.start + g_text.size && uses < 6; p++) {
+        if (!((p[0] & 0xFB) == 0x48 && p[1] == 0x8D && (p[2] & 0xC7) == 0x05)) continue;
+        if (Rel32(p, 3, 7) != str) continue;
+        uses++;
+        char hex[3 * 96 + 1] = {};
+        for (int i = 0; i < 96; i++) sprintf(hex + i * 3, "%02X ", p[i - 40]);
+        Log("  use at exe+%llx (lea at byte 40): %s",
+            (unsigned long long)(p - (BYTE*)GetModuleHandleW(nullptr)), hex);
+    }
+    if (!uses) Log("  (no code references the name)");
     return b;
+}
+
+// Identifies the game build in the log (file version, link timestamp, image size).
+void LogGameBuild()
+{
+    wchar_t path[MAX_PATH];
+    GetModuleFileNameW(nullptr, path, MAX_PATH);
+    char version[64] = "unknown";
+    DWORD dummy = 0, size = GetFileVersionInfoSizeW(path, &dummy);
+    if (size) {
+        std::vector<BYTE> buf(size);
+        VS_FIXEDFILEINFO* fi = nullptr;
+        UINT len = 0;
+        if (GetFileVersionInfoW(path, 0, size, buf.data()) && VerQueryValueW(buf.data(), L"\\", (void**)&fi, &len) && fi)
+            snprintf(version, sizeof(version), "%u.%u.%u.%u", HIWORD(fi->dwFileVersionMS), LOWORD(fi->dwFileVersionMS),
+                     HIWORD(fi->dwFileVersionLS), LOWORD(fi->dwFileVersionLS));
+    }
+    auto base = (BYTE*)GetModuleHandleW(nullptr);
+    auto nt = (IMAGE_NT_HEADERS*)(base + ((IMAGE_DOS_HEADER*)base)->e_lfanew);
+    Log("game build: file version %s, link stamp %08lx, image size %lu", version,
+        (unsigned long)nt->FileHeader.TimeDateStamp, (unsigned long)nt->OptionalHeader.SizeOfImage);
 }
 
 } // namespace
 
 bool InstallGamePatches()
 {
+    LogGameBuild();
     if (!FindSections()) {
         Log("game: .text not found");
         return false;

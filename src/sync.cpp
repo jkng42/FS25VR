@@ -87,6 +87,7 @@ bool InstallEyeSync()
     // keeps 'this' in rbx and first tests a flag at this+0x295. The prologue before it changes
     // with compiler versions, so it is matched against known forms that can be relocated.
     BYTE* anchor = FindPattern("0F 28 F1 48 8B D9 33 F6 40 38 B1 95 02 00 00 0F 84");
+    if (!anchor) anchor = FindPattern("0F 28 F1 48 8B D9 33 F6 40 38 B1 ?? ?? 00 00 0F 84");  // flag moved
     if (!anchor) {
         Log("eye sync: RunFrame not found (game version changed?); eyes will not be synchronised");
         return false;
@@ -110,13 +111,17 @@ bool InstallEyeSync()
         Log("eye sync: unknown RunFrame prologue (%s); eyes will not be synchronised", hex);
         return false;
     }
-    BYTE* tramp = (BYTE*)VirtualAlloc(nullptr, 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    // trampoline: the relocated prologue, then a jump back. Written while writable, then locked
+    // to execute-only (never writable and executable at the same time).
+    BYTE* tramp = (BYTE*)VirtualAlloc(nullptr, 64, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     if (!tramp) return false;
     memcpy(tramp, fn, kPrologue);
     BYTE jmp[14] = {0xFF, 0x25, 0, 0, 0, 0};  // jmp [rip+0] ; dq target
     BYTE* back = fn + kPrologue;
     memcpy(jmp + 6, &back, 8);
     memcpy(tramp + kPrologue, jmp, sizeof(jmp));
+    DWORD old;
+    if (!VirtualProtect(tramp, 64, PAGE_EXECUTE_READ, &old)) return false;
     FlushInstructionCache(GetCurrentProcess(), tramp, 64);
     o_RunFrame = (PFN_RunFrame)tramp;
     bool ok = WriteJump(fn, (void*)Hook_RunFrame);

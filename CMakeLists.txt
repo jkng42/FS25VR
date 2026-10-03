@@ -30,7 +30,7 @@ target_compile_options(dinput8 PRIVATE /W3 /EHsc /Zi)
 target_link_options(dinput8 PRIVATE /DEBUG /OPT:REF)
 target_link_libraries(dinput8 PRIVATE
     ${OPENXR_DIR}/x64/lib/openxr_loader.lib
-    d3d12 dxgi dxguid)
+    d3d12 dxgi dxguid version)
 # The loader is delay-loaded from our own folder so the proxy never fails to load if it is missing.
 target_link_options(dinput8 PRIVATE /DELAYLOAD:openxr_loader.dll)
 target_link_libraries(dinput8 PRIVATE delayimp)

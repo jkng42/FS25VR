@@ -94,6 +94,12 @@ Get-ChildItem "D:\path\to\Farming Simulator 25\x64\dinput8.dll", "D:\path\to\Far
 
 `INSTALL.bat` does this automatically from version 0.1.2. It mostly happens after copying the files by hand, or when unzipping with a tool that keeps the block mark.
 
+### Windows Defender says `dinput8.dll` is "Trojan:Win32/Wacatac" (or another antivirus flags it)
+
+That's a **false positive**. The `!ml` at the end of names like `Wacatac.C!ml` means it's a guess by Microsoft's machine-learning model, not a match against known malware. The model distrusts what every VR injector (and tools like ReShade) has to do: an unsigned DLL placed next to a game that hooks the game's graphics. Other engines on VirusTotal report it as clean. The source is fully open in this repository, and each release lists SHA-256 checksums so you can check your copy is the official one.
+
+If Defender quarantined the file, VR won't start. To restore it: **Windows Security → Virus & threat protection → Protection history**, select the entry → **Actions → Restore**. Optionally, add an exclusion for the game's `x64` folder. You can also help by reporting it to Microsoft as incorrectly detected at https://www.microsoft.com/en-us/wdsi/filesubmission.
+
 ### How do I know whether the VR part is running?
 
 Open `<game>\x64\fs25vr.log`. If the file doesn't exist at all, the DLL never loaded: it was blocked (see above) or isn't in the `x64` folder. If it exists, it lists each step: engine hooks found, swap chain, OpenXR runtime and session, frame rate and GPU time. The game's own `log.txt` should also contain `[FS25_VR] native bridge v1 connected`.
