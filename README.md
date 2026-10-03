@@ -112,6 +112,17 @@ The game shows menus, the map, the shop and loading screens on a flat screen on 
 
 Keep the game's frame rate high: ideally above your headset's refresh rate, since each eye updates at half the game's frame rate. Make sure frame generation (DLSS, XeSS or FSR), DLSS/DSR upscaling and motion blur are **off**. If moving objects still look doubled, set `syncPhase=1` in `fs25vr.ini`.
 
+### The frame rate is low even though my PC is fast
+
+Please send a performance log:
+
+1. Open `<game>\x64\fs25vr.ini` in Notepad, change `profile=0` to `profile=1` and save.
+2. Play in VR for 3–5 minutes, including a bit of driving.
+3. Quit, then attach `fs25vr.log`, `fs25vr_profile.csv` and `fs25vr_compositor.csv` (all in the `x64` folder) to an [issue](https://github.com/nick10180/FS25VR/issues).
+4. Set `profile=0` again afterwards.
+
+The log shows where each frame's time goes: game CPU, GPU, waiting, and every call into SteamVR or your headset's runtime.
+
 ### Is the DLL safe?
 
 The full source code is in this repository, and every release lists SHA-256 checksums (`SHA256SUMS.txt` in the zip). It does not modify any game files. Deleting the three files from the `x64` folder removes it completely.
