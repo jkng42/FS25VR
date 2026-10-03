@@ -41,12 +41,36 @@ struct Chain {
     std::vector<ID3D12Resource*>             images;
     D3D12_CPU_DESCRIPTOR_HANDLE              rtvBase{};
     uint32_t                                 w = 0, h = 0;
+
+    // Async mode: the game thread draws into this texture (never touching the OpenXR swapchain);
+    // the compositor thread copies it into a swapchain image once per headset frame.
+    ID3D12Resource*                          staging = nullptr;   // rests in RENDER_TARGET
+    D3D12_CPU_DESCRIPTOR_HANDLE              stagingRtv{};
+    bool                                     staged = false;      // new image not yet copied
+    XrPosef                                  stagedPose{};
+    XrFovf                                   stagedFov{};
 };
 
 struct State {
     std::recursive_mutex mtx;
     std::mutex           chainMtx;  // swapchain acquire/release (game thread) vs xrEndFrame (compositor)
     uint64_t             chainGen = 0;  // bumped (under chainMtx) whenever swapchains are destroyed
+    bool                 compUsingChains = false;  // compositor is between acquire and xrEndFrame
+
+    // compositor thread GPU objects (staging -> swapchain copies)
+    ID3D12CommandAllocator*    cAlloc[3] = {};
+    UINT64                     cAllocFence[3] = {};
+    ID3D12GraphicsCommandList* cList = nullptr;
+    ID3D12Fence*               cFence = nullptr;
+    UINT64                     cFenceValue = 0;
+    HANDLE                     cEvent = nullptr;
+    int                        cIndex = 0;
+
+    // compositor timing (seconds, summed over the stats window)
+    double               cWait = 0, cBegin = 0, cAcquire = 0, cEnd = 0;
+    uint64_t             cEyeImages = 0;
+    uint64_t             compTotal = 0;
+    FILE*                compCsv = nullptr;
 
     ID3D12Device*        device = nullptr;
     ID3D12CommandQueue*  queue = nullptr;
@@ -119,6 +143,7 @@ struct State {
     // where frame time goes (seconds, summed over the stats window)
     double         tGame = 0, tWait = 0, tSubmit = 0, tPresent = 0;
     double         tLockWait = 0;   // game thread time spent waiting for this state lock
+    double         tChainWait = 0;  // game thread time waiting for a free swapchain image
     LARGE_INTEGER  tFrameStart{}, tPresentStart{};
     prof::CpuFrame cur;            // this frame's numbers for the profiler
     uint64_t       curFrame = 0;
@@ -220,6 +245,7 @@ XrPosef YawOnly(const XrPosef& p)
 void DestroyChain(Chain& c)
 {
     if (c.handle) xrDestroySwapchain(c.handle);
+    if (c.staging) c.staging->Release();
     c = Chain{};
 }
 
@@ -445,8 +471,33 @@ bool InitSession()
     return true;
 }
 
-bool CreateChain(Chain& c, uint32_t w, uint32_t h, UINT rtvOffset)
+bool CreateChain(Chain& c, uint32_t w, uint32_t h, UINT rtvOffset, UINT stagingRtvIndex)
 {
+    // staging texture for async submission (same format and size as the swapchain images)
+    D3D12_HEAP_PROPERTIES hp = {D3D12_HEAP_TYPE_DEFAULT};
+    D3D12_RESOURCE_DESC td = {};
+    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width = w;
+    td.Height = h;
+    td.DepthOrArraySize = 1;
+    td.MipLevels = 1;
+    td.Format = S.chainFormat;
+    td.SampleDesc.Count = 1;
+    td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    if (FAILED(S.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                                 nullptr, IID_PPV_ARGS(&c.staging)))) {
+        Log("could not create staging texture %ux%u", w, h);
+        return false;
+    }
+    c.stagingRtv = S.rtvHeap->GetCPUDescriptorHandleForHeapStart();
+    c.stagingRtv.ptr += (SIZE_T)stagingRtvIndex * S.rtvInc;
+    {
+        D3D12_RENDER_TARGET_VIEW_DESC rd = {};
+        rd.Format = S.chainFormat;
+        rd.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+        S.device->CreateRenderTargetView(c.staging, &rd, c.stagingRtv);
+    }
+
     XrSwapchainCreateInfo ci{XR_TYPE_SWAPCHAIN_CREATE_INFO};
     ci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
     ci.format = S.chainFormat;
@@ -481,13 +532,15 @@ bool CreateChain(Chain& c, uint32_t w, uint32_t h, UINT rtvOffset)
 bool EnsureSwapchains(UINT w, UINT h)
 {
     if (S.eyes[0].handle && S.eyes[0].w == w && S.eyes[0].h == h) return true;
+    if (S.compUsingChains) return false;  // compositor is submitting them; rebuild on a later frame
     DestroySwapchains();
     D3D12_DESCRIPTOR_HEAP_DESC hd = {};
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-    hd.NumDescriptors = 24;
+    hd.NumDescriptors = 27;  // 3 chains x 8 swapchain images + 3 staging textures
     if (FAILED(S.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&S.rtvHeap)))) return false;
     S.rtvInc = S.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-    if (!CreateChain(S.eyes[0], w, h, 0) || !CreateChain(S.eyes[1], w, h, 8) || !CreateChain(S.quad, w, h, 16))
+    if (!CreateChain(S.eyes[0], w, h, 0, 24) || !CreateChain(S.eyes[1], w, h, 8, 25) ||
+        !CreateChain(S.quad, w, h, 16, 26))
         return false;
     Log("OpenXR swapchains created %ux%u", w, h);
     return true;
@@ -647,16 +700,24 @@ void RecordMirror(ID3D12Resource* bb, Mirror mode)
 bool CopyToChain(Chain& chain, ID3D12Resource* bb, DXGI_FORMAT bbFormat, bool sampleMarker = false,
                  Mirror mirror = Mirror::None, const CursorDraw* cursor = nullptr)
 {
-    std::lock_guard<std::mutex> chains(S.chainMtx);  // vs. the compositor's xrEndFrame
+    // Async mode draws into the chain's staging texture and never calls OpenXR here: on some
+    // runtimes (Quest via Steam Link) swapchain calls block until the next headset refresh, which
+    // would pace the game to the headset. The compositor thread copies staging -> swapchain.
+    // Sync mode writes the swapchain image directly.
     uint32_t idx = 0;
-    XrSwapchainImageAcquireInfo ai{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
-    if (XR_FAILED(xrAcquireSwapchainImage(chain.handle, &ai, &idx))) return false;
-    XrSwapchainImageWaitInfo wi{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
-    wi.timeout = 100000000;  // 100 ms
-    if (XR_FAILED(xrWaitSwapchainImage(chain.handle, &wi))) {
-        XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-        xrReleaseSwapchainImage(chain.handle, &ri);
-        return false;
+    if (!S.async) {
+        LARGE_INTEGER a0 = Now();
+        XrSwapchainImageAcquireInfo ai{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+        if (XR_FAILED(xrAcquireSwapchainImage(chain.handle, &ai, &idx))) return false;
+        XrSwapchainImageWaitInfo wi{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+        wi.timeout = 100000000;  // 100 ms
+        XrResult waited = xrWaitSwapchainImage(chain.handle, &wi);
+        S.tChainWait += Seconds(a0, Now());
+        if (XR_FAILED(waited)) {
+            XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+            xrReleaseSwapchainImage(chain.handle, &ri);
+            return false;
+        }
     }
 
     int a = S.allocIndex;
@@ -698,6 +759,7 @@ bool CopyToChain(Chain& chain, ID3D12Resource* bb, DXGI_FORMAT bbFormat, bool sa
 
     D3D12_CPU_DESCRIPTOR_HANDLE rtv = chain.rtvBase;
     rtv.ptr += (SIZE_T)idx * S.rtvInc;
+    if (S.async) rtv = chain.stagingRtv;
     S.blit.Record(S.cl, bb, bbFormat, rtv, chain.w, chain.h, cursor);
 
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
@@ -711,8 +773,10 @@ bool CopyToChain(Chain& chain, ID3D12Resource* bb, DXGI_FORMAT bbFormat, bool sa
     S.queue->Signal(S.fence, S.allocFence[a]);
     if (markerSlot >= 0) S.samples[S.sampleCount++] = {S.presentCount, S.allocFence[a], markerSlot, bbFormat};
 
-    XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-    xrReleaseSwapchainImage(chain.handle, &ri);
+    if (!S.async) {
+        XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+        xrReleaseSwapchainImage(chain.handle, &ri);
+    }
     return true;
 }
 
@@ -937,14 +1001,26 @@ void CopyFrame(IDXGISwapChain* swap)
             if (S.calibrating && !IsCalibFormat(desc.Format))
                 FinishCalibration("backbuffer format cannot be sampled, keeping configured value");
             Mirror m = EnsureMirror(bb) ? (rec.eye == 0 ? Mirror::Save : Mirror::Restore) : Mirror::None;
-            if (!S.lastWasStereo) S.eyeValid[rec.eye ^ 1] = false;  // stale image from before a menu
+            if (!S.lastWasStereo) {  // stale image from before a menu
+                S.eyeValid[rec.eye ^ 1] = false;
+                S.eyes[rec.eye ^ 1].staged = false;
+            }
             if (CopyToChain(S.eyes[rec.eye], bb, desc.Format, S.calibrating, m, &cursor)) {
-                S.eyeValid[rec.eye] = true;
-                S.eyePose[rec.eye] = rec.pose;
-                S.eyeFov[rec.eye] = rec.fov;
+                if (S.async) {  // the compositor submits it (and sets eyeValid/eyePose)
+                    S.eyes[rec.eye].staged = true;
+                    S.eyes[rec.eye].stagedPose = rec.pose;
+                    S.eyes[rec.eye].stagedFov = rec.fov;
+                } else {
+                    S.eyeValid[rec.eye] = true;
+                    S.eyePose[rec.eye] = rec.pose;
+                    S.eyeFov[rec.eye] = rec.fov;
+                }
             }
         } else if (CopyToChain(S.quad, bb, desc.Format, false, Mirror::None, &cursor)) {
-            S.quadValid = true;
+            if (S.async)
+                S.quad.staged = true;
+            else
+                S.quadValid = true;
         }
         S.showStereo = stereo;
         S.lastWasStereo = stereo;
@@ -998,6 +1074,59 @@ void SubmitFrame()
     S.compFrames++;
 }
 
+// Compositor thread: copies each marked staging texture into its acquired swapchain image.
+// Called with the state lock held, so the game thread cannot draw into a staging texture until
+// the copy has been submitted (the GPU executes the queue in submission order).
+int RecordStagingCopies(Chain* chains[3], const bool copy[3], const uint32_t idx[3])
+{
+    if (!S.cList) {
+        for (auto& a : S.cAlloc)
+            if (FAILED(S.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&a)))) return 0;
+        if (FAILED(S.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, S.cAlloc[0], nullptr,
+                                               IID_PPV_ARGS(&S.cList))))
+            return 0;
+        S.cList->Close();
+        if (FAILED(S.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&S.cFence)))) return 0;
+        S.cEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    }
+    int a = S.cIndex;
+    S.cIndex = (S.cIndex + 1) % 3;
+    if (S.cFence->GetCompletedValue() < S.cAllocFence[a]) {
+        S.cFence->SetEventOnCompletion(S.cAllocFence[a], S.cEvent);
+        WaitForSingleObject(S.cEvent, 1000);
+    }
+    S.cAlloc[a]->Reset();
+    S.cList->Reset(S.cAlloc[a], nullptr);
+    int n = 0;
+    for (int i = 0; i < 3; i++) {
+        if (!copy[i]) continue;
+        ID3D12Resource* img = chains[i]->images[idx[i]];
+        D3D12_RESOURCE_BARRIER b[2] = {};
+        for (auto& x : b) {
+            x.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            x.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        }
+        b[0].Transition.pResource = chains[i]->staging;
+        b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        b[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        b[1].Transition.pResource = img;  // swapchain images are handed out in RENDER_TARGET
+        b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+        S.cList->ResourceBarrier(2, b);
+        S.cList->CopyResource(img, chains[i]->staging);
+        std::swap(b[0].Transition.StateBefore, b[0].Transition.StateAfter);
+        std::swap(b[1].Transition.StateBefore, b[1].Transition.StateAfter);
+        S.cList->ResourceBarrier(2, b);
+        n++;
+    }
+    S.cList->Close();
+    ID3D12CommandList* lists[] = {S.cList};
+    S.queue->ExecuteCommandLists(1, lists);
+    S.cAllocFence[a] = ++S.cFenceValue;
+    S.queue->Signal(S.cFence, S.cAllocFence[a]);
+    return n;
+}
+
 // Async mode, one headset frame. The OpenXR frame calls (which can block for most of a headset
 // frame inside the runtime) are made WITHOUT the state lock: the game thread takes that lock
 // several times per frame (Present, eye-pose queries from Lua) and must never queue behind the
@@ -1033,12 +1162,41 @@ void CompositorFrame()
         Log("xrBeginFrame failed %d", r);
         return;
     }
+    LARGE_INTEGER b1 = Now();
     XrSpaceLocation loc{XR_TYPE_SPACE_LOCATION};
     bool recentred = wantRecenter && XR_SUCCEEDED(xrLocateSpace(view, local, fs.predictedDisplayTime, &loc)) &&
                      (loc.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT) &&
                      (loc.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT);
 
-    // snapshot the newest images and their render poses
+    // 1. which chains have a new image from the game? Mark the chains in use so the game thread
+    //    does not rebuild them until this frame has been submitted.
+    Chain* chains[3] = {&S.eyes[0], &S.eyes[1], &S.quad};
+    bool copy[3] = {false, false, false};
+    {
+        std::lock_guard<std::recursive_mutex> lock(S.mtx);
+        S.compUsingChains = true;
+        for (int i = 0; i < 3; i++) copy[i] = chains[i]->staged && chains[i]->handle && chains[i]->staging;
+    }
+
+    // 2. get free swapchain images (may block on some runtimes - this thread only, never the game)
+    LARGE_INTEGER a0 = Now();
+    uint32_t idx[3] = {};
+    for (int i = 0; i < 3; i++) {
+        if (!copy[i]) continue;
+        XrSwapchainImageAcquireInfo ai{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+        if (XR_FAILED(xrAcquireSwapchainImage(chains[i]->handle, &ai, &idx[i]))) { copy[i] = false; continue; }
+        XrSwapchainImageWaitInfo wi2{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+        wi2.timeout = 100000000;  // 100 ms
+        if (XR_FAILED(xrWaitSwapchainImage(chains[i]->handle, &wi2))) {
+            XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+            xrReleaseSwapchainImage(chains[i]->handle, &ri);
+            copy[i] = false;
+        }
+    }
+    LARGE_INTEGER a1 = Now();
+
+    // 3. under the lock (so the game cannot overwrite a staging texture before the copy executes):
+    //    copy staging -> swapchain image, take over the pose it was rendered with, build the layers
     XrCompositionLayerProjection proj{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
     XrCompositionLayerProjectionView pv[2] = {{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW},
                                               {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW}};
@@ -1046,8 +1204,21 @@ void CompositorFrame()
     XrCompositionLayerBaseHeader* layers[1];
     uint32_t layerCount = 0;
     uint64_t gen;
+    int copied = 0;
     {
         std::lock_guard<std::recursive_mutex> lock(S.mtx);
+        if (copy[0] || copy[1] || copy[2]) copied = RecordStagingCopies(chains, copy, idx);
+        for (int e = 0; e < 2; e++)
+            if (copy[e]) {
+                S.eyePose[e] = chains[e]->stagedPose;
+                S.eyeFov[e] = chains[e]->stagedFov;
+                S.eyeValid[e] = true;
+                chains[e]->staged = false;
+            }
+        if (copy[2]) {
+            S.quadValid = true;
+            chains[2]->staged = false;
+        }
         gen = S.chainGen;
         S.predictedTime = fs.predictedDisplayTime;
         S.predictedPeriod = fs.predictedDisplayPeriod;
@@ -1084,14 +1255,50 @@ void CompositorFrame()
         }
     }
 
+    // 4. hand the images back (the runtime waits on the queue for the copies) and end the frame
+    for (int i = 0; i < 3; i++)
+        if (copy[i]) {
+            XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+            xrReleaseSwapchainImage(chains[i]->handle, &ri);
+        }
     XrFrameEndInfo fe{XR_TYPE_FRAME_END_INFO};
     fe.displayTime = fs.predictedDisplayTime;
     fe.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
-    std::lock_guard<std::mutex> chains(S.chainMtx);
-    fe.layerCount = gen == S.chainGen ? layerCount : 0;  // swapchains rebuilt since the snapshot
-    fe.layers = layers;
-    r = xrEndFrame(session, &fe);
+    LARGE_INTEGER e0 = Now();
+    {
+        std::lock_guard<std::mutex> chainLock(S.chainMtx);
+        fe.layerCount = gen == S.chainGen ? layerCount : 0;  // swapchains rebuilt since the snapshot
+        fe.layers = layers;
+        r = xrEndFrame(session, &fe);
+    }
+    LARGE_INTEGER e1 = Now();
     if (XR_FAILED(r)) Log("xrEndFrame failed %d", r);
+
+    std::lock_guard<std::recursive_mutex> lock(S.mtx);
+    S.compUsingChains = false;
+    // compositor timing (log summary every 10 s; per-frame CSV with profile=1)
+    double tw = Seconds(w0, w1), tb = Seconds(w1, b1), ta = Seconds(a0, a1), te = Seconds(e0, e1);
+    S.cWait += tw;
+    S.cBegin += tb;
+    S.cAcquire += ta;
+    S.cEnd += te;
+    S.cEyeImages += (copy[0] ? 1 : 0) + (copy[1] ? 1 : 0);
+    if (g_config.profile) {
+        if (!S.compCsv) {
+            S.compCsv = _wfopen((ModuleDir() + L"fs25vr_compositor.csv").c_str(), L"w");
+            if (S.compCsv)
+                fprintf(S.compCsv, "headset_frame,wait_frame_ms,begin_frame_ms,acquire_images_ms,end_frame_ms,"
+                                   "left_new,right_new,menu_new,layers,should_render\n");
+        }
+        if (S.compCsv) {
+            fprintf(S.compCsv, "%llu,%.3f,%.3f,%.3f,%.3f,%d,%d,%d,%u,%d\n", (unsigned long long)S.compTotal, tw * 1000,
+                    tb * 1000, ta * 1000, te * 1000, copy[0], copy[1], copy[2], (unsigned)fe.layerCount,
+                    S.shouldRender);
+            if ((S.compTotal % 90) == 0) fflush(S.compCsv);
+        }
+    }
+    S.compTotal++;
+    (void)copied;
 }
 
 // Async mode: the OpenXR frame loop runs here at the headset's rate, independent of the game.
@@ -1159,10 +1366,17 @@ void LogStats()
     Log("  per frame CPU: game %.1f ms, VR submit %.1f ms, Present %.1f ms, waiting for headset %.1f ms%s",
         S.tGame / n * 1000, S.tSubmit / n * 1000, S.tPresent / n * 1000, S.async ? 0.0 : S.tWait / n * 1000,
         S.async ? " (async: headset paced separately)" : "");
-    Log("  lock waits on the game thread: %.2f ms per frame", S.tLockWait / n * 1000);
+    Log("  game thread waits: state lock %.2f ms, free headset image %.2f ms per frame", S.tLockWait / n * 1000,
+        S.tChainWait / n * 1000);
     if (S.async) {
-        Log("  compositor: %.1f headset frames/s", S.compFrames / sec);
+        double cn = (double)std::max<uint64_t>(1, S.compFrames);
+        Log("  compositor: %.1f headset frames/s, %.1f new eye images/s; per headset frame: wait %.1f ms, "
+            "begin %.2f ms, image acquire %.2f ms, end %.2f ms",
+            S.compFrames / sec, S.cEyeImages / sec, S.cWait / cn * 1000, S.cBegin / cn * 1000,
+            S.cAcquire / cn * 1000, S.cEnd / cn * 1000);
         S.compFrames = 0;
+        S.cWait = S.cBegin = S.cAcquire = S.cEnd = 0;
+        S.cEyeImages = 0;
     }
     if (prof::Enabled()) {
         prof::Summary g = prof::TakeSummary();
@@ -1170,7 +1384,7 @@ void LogStats()
             g.gpuFrame, g.gpuFrameL, g.gpuFrameR, g.gpuVr, g.runFrameL, g.runFrameR);
     }
     S.statPresents = S.statStereo = 0;
-    S.tGame = S.tWait = S.tSubmit = S.tPresent = S.tLockWait = 0;
+    S.tGame = S.tWait = S.tSubmit = S.tPresent = S.tLockWait = S.tChainWait = 0;
     S.statStart = now;
 }
 
