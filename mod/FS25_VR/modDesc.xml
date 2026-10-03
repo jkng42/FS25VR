@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8" standalone="no" ?>
+<modDesc descVersion="95">
+    <author>nick10180</author>
+    <version>0.1.0.0</version>
+    <title>
+        <en>VR (OpenXR, stereoscopic 6DOF)</en>
+        <de>VR (OpenXR, stereoskopisch 6DOF)</de>
+    </title>
+    <description>
+        <en><![CDATA[Native stereoscopic VR with full 6DOF head tracking, on foot and in the cab.
+Mod for Farming Simulator. Unofficial - not affiliated with or endorsed by GIANTS Software.
+
+Requires the fs25vr bridge (dinput8.dll + openxr_loader.dll in the game's x64 folder) and an
+OpenXR runtime (SteamVR, Oculus, WMR, Virtual Desktop...).
+
+F6: projection centred / off-centre
+F7: ambient occlusion: game setting / force SAO
+F8: recentre the view
+F9: VR camera on/off
+F10: HUD on/off in VR (hidden by default)]]></en>
+    </description>
+    <iconFilename>icon_vr.dds</iconFilename>
+    <multiplayer supported="true" />
+    <extraSourceFiles>
+        <sourceFile filename="scripts/VRMain.lua" />
+    </extraSourceFiles>
+</modDesc>

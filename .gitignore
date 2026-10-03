@@ -1,0 +1,12 @@
+# build output
+/build/
+/release/
+
+# third-party binaries are downloaded, not committed (see README "Building")
+/third_party/openxr/
+/third_party/luau/
+
+# local logs / dumps
+*.log
+fs25vr_profile.csv
+fs25vr_dump_*.bmp
