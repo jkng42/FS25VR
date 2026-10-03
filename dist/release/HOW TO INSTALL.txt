@@ -52,6 +52,11 @@ UNINSTALL
   openxr_loader.dll and fs25vr.ini from the game's x64 folder).
 
 SOMETHING WRONG?
+  - The mod shows in the list but it stays flat and F8/F9/F10 do
+    nothing: Windows has blocked the DLLs. In the game's x64 folder,
+    right-click dinput8.dll > Properties > tick "Unblock" > OK.
+    Do the same for openxr_loader.dll. (INSTALL.bat normally does
+    this for you.)
   - Everything is a flat screen: the VR mod isn't ticked for that
     savegame, or you're in a menu.
   - Stutters: lower the game's graphics settings. VR needs a high

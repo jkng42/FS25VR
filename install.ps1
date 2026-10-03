@@ -152,6 +152,12 @@ if ($release) {
     }
 }
 
+# Files downloaded from the internet carry Windows' "came from another computer" mark. On some
+# PCs that stops the game from loading the (unsigned) DLLs: the mod shows up but VR never starts.
+foreach ($f in (Join-Path $x64 "dinput8.dll"), (Join-Path $x64 "openxr_loader.dll"), (Join-Path $x64 "fs25vr.ini"), $zip) {
+    if (Test-Path $f) { Unblock-File -Path $f -ErrorAction SilentlyContinue }
+}
+
 if ($AutoResolution) {
     $log = Join-Path $x64 "fs25vr.log"
     $m = if (Test-Path $log) { Select-String -Path $log -Pattern 'recommended render size for the centred frustum: (\d+)x(\d+)' | Select-Object -Last 1 }

@@ -20,16 +20,16 @@ fs25vr turns Farming Simulator 25 into a real VR game through OpenXR. It works w
 ## Install
 
 1. Download the latest release zip from https://github.com/nick10180/FS25VR/releases and unpack it anywhere.
-2. Run `install.ps1` (right-click → *Run with PowerShell*, or
-   `powershell -ExecutionPolicy Bypass -File install.ps1`). It finds the game through Steam. If that fails, pass `-GameDir "D:\path\to\Farming Simulator 25"`.
-   - Or install manually: copy everything in `x64\` into `<game>\x64\` and `mod\FS25_VR.zip` into your mods folder.
+2. Double-click **`INSTALL.bat`**. It finds the game through Steam, the Windows installed-programs list or Epic, and asks for the folder if it can't.
+   - If Windows says *"Windows protected your PC"*, click **More info**, then **Run anyway**.
+   - Or install manually: copy everything in `x64\` into `<game>\x64\` and `mod\FS25_VR.zip` into your mods folder. If you copy by hand, **unblock the DLLs** (see the [FAQ](#faq)).
 3. Start the game with your headset connected. Enable **VR (OpenXR, stereoscopic 6DOF)** in the mod list when you load a savegame.
 
-To uninstall, run `install.ps1 -Uninstall`, or delete `dinput8.dll`, `openxr_loader.dll` and `fs25vr.ini` from `<game>\x64` and remove the mod.
+To uninstall, double-click **`UNINSTALL.bat`**, or delete `dinput8.dll`, `openxr_loader.dll` and `fs25vr.ini` from `<game>\x64` and remove the mod.
 
 ### Recommended setup
 
-- **Render size.** After the first VR session, `<game>\x64\fs25vr.log` contains a line like `recommended render size for the centred frustum: 5672x4336`. Apply it with `install.ps1 -EyeResolution -EyeWidth 5672 -EyeHeight 4336`. That sets windowed mode at that size and turns vsync off; your old `game.xml` is backed up. The window is shrunk to fit your monitor automatically.
+- **Render size.** After your first VR session, quit the game and double-click **`SET VR RESOLUTION.bat`**. It reads the ideal size for your headset from `<game>\x64\fs25vr.log`, switches the game to a window of that size and turns vsync off. Your old `game.xml` is backed up, and the window is shrunk to fit your monitor automatically.
 - **In the game's graphics settings:** turn off **FSR3 frame generation**, **DLSS/DSR** and **motion blur**. Alternate-eye rendering confuses effects that blend across frames. Ambient occlusion and screen-space reflections work.
 - **Frame rate.** Each eye updates at half the game's frame rate. Aim for at least your headset's refresh rate in game fps. The log reports the frame rate and GPU time every 10 seconds.
 
@@ -73,11 +73,46 @@ Eyes are rendered alternately: one game frame per eye. Each image goes to the he
 - **Multiplayer:** works if the server has the mod, but has had little testing.
 - **Game updates** can stop the bridge from finding the engine functions it needs. It then logs this and falls back to a flat screen; it won't crash.
 
-## Troubleshooting
+## FAQ
 
-- `<game>\x64\fs25vr.log` shows each step: engine hooks found, swap chain, OpenXR runtime and session, frame rate, GPU time.
-- The game's `log.txt` should contain `[FS25_VR] native bridge v1 connected`. If it says the bridge is not found, `dinput8.dll` is not in `<game>\x64`.
-- **Everything is a flat screen:** the mod is not active in that savegame, or you are in a menu.
+### I can see the mod in the list in game, but it stays a flat screen and none of the keys (F8, F9, F10…) respond
+
+Windows has most likely **blocked the DLLs**. Files downloaded from the internet are marked *"This file came from another computer and might be blocked"*. On some PCs, Windows then refuses to let the game load `dinput8.dll` and `openxr_loader.dll`, because they are not digitally signed. The mod loads, but the part that does VR never starts.
+
+To fix it, close the game and unblock both files:
+
+1. Go to the game's `x64` folder (for example `...\steamapps\common\Farming Simulator 25\x64`).
+2. Right-click **`dinput8.dll`** → **Properties**.
+3. At the bottom of the **General** tab, tick **Unblock**, then click **OK**. If there is no Unblock box, the file isn't blocked.
+4. Do the same for **`openxr_loader.dll`**.
+
+Or do both at once from PowerShell:
+
+```powershell
+Get-ChildItem "D:\path\to\Farming Simulator 25\x64\dinput8.dll", "D:\path\to\Farming Simulator 25\x64\openxr_loader.dll" | Unblock-File
+```
+
+`INSTALL.bat` does this automatically from version 0.1.2. It mostly happens after copying the files by hand, or when unzipping with a tool that keeps the block mark.
+
+### How do I know whether the VR part is running?
+
+Open `<game>\x64\fs25vr.log`. If the file doesn't exist at all, the DLL never loaded: it was blocked (see above) or isn't in the `x64` folder. If it exists, it lists each step: engine hooks found, swap chain, OpenXR runtime and session, frame rate and GPU time. The game's own `log.txt` should also contain `[FS25_VR] native bridge v1 connected`.
+
+### Everything is a flat screen in the headset, but the keys work
+
+The game shows menus, the map, the shop and loading screens on a flat screen on purpose. In a savegame, check that **VR (OpenXR, stereoscopic 6DOF)** is ticked in the mod list, and press **F9** in case the VR camera was switched off.
+
+### The image stutters or looks doubled when I turn or drive
+
+Keep the game's frame rate high: ideally above your headset's refresh rate, since each eye updates at half the game's frame rate. Make sure frame generation (DLSS, XeSS or FSR), DLSS/DSR upscaling and motion blur are **off**. If moving objects still look doubled, set `syncPhase=1` in `fs25vr.ini`.
+
+### Is the DLL safe?
+
+The full source code is in this repository, and every release lists SHA-256 checksums (`SHA256SUMS.txt` in the zip). It does not modify any game files. Deleting the three files from the `x64` folder removes it completely.
+
+### Something else is wrong
+
+Open an [issue](https://github.com/nick10180/FS25VR/issues) and attach `<game>\x64\fs25vr.log`.
 
 ## Building from source
 
