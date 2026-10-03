@@ -285,17 +285,17 @@ function VRMod:applyEye(cam, anchorFn)
     if cam == nil or cam == 0 then
         return false
     end
-    local ok, eye, px, py, pz, qx, qy, qz, qw, fovY, offX, offY, frame = self.api.getView()
+    local ok, eye, px, py, pz, qx, qy, qz, qw, fovY, offX, offY, frame, second = self.api.getView()
     if not ok then
         return false
     end
-    local anchor, offsetKey = anchorFn(eye, frame)
+    local anchor, offsetKey = anchorFn(eye, frame, second)
     if anchor == nil then
         return false
     end
-    -- the offset only changes on left-eye frames, so both images of a pair agree
+    -- the offset only changes on the first frame of a pair, so both images of a pair agree
     self.activeOffsetKey = offsetKey
-    if eye == 0 or offsetKey ~= self.pairOffsetKey then
+    if not second or offsetKey ~= self.pairOffsetKey then
         self.pairOffsetKey = offsetKey
         local o = offsetKey ~= nil and self.offsets[offsetKey] or nil
         if o ~= nil then
@@ -346,12 +346,15 @@ function VRMod:applyEye(cam, anchorFn)
     return true
 end
 
--- World anchors (on foot, exterior cameras) only move on left-eye frames, so both images of a
--- stereo pair see the world from the same body position and heading. Otherwise turning with the
--- mouse or stick rotates the world between the left and right image, which the compositor cannot
--- correct (it only knows about head motion) and shows as tearing/doubling in the middle.
-function VRMod:holdWorldAnchor(cam, eye, frame)
-    local hold = eye == 1 and self.anchorCam == cam and self.anchorFrame == frame - 1
+-- World anchors (on foot, exterior cameras) only move on the first frame of a stereo pair, so
+-- both images of a pair see the world from the same body position and heading. Otherwise turning
+-- with the mouse or stick rotates the world between the left and right image, which the
+-- compositor cannot correct (it only knows about head motion) and shows as tearing/doubling.
+function VRMod:holdWorldAnchor(cam, eye, frame, second)
+    if second == nil then
+        second = eye == 1  -- bridge before 0.1.9
+    end
+    local hold = second and self.anchorCam == cam and self.anchorFrame == frame - 1
     if not hold then
         self.anchorCam = cam
         self.anchorFrame = frame
@@ -424,12 +427,12 @@ function VRMod:onVehicleCameraUpdated(vcam)
     if cam ~= getCamera() then
         return
     end
-    self:applyEye(cam, function(eye, frame)
+    self:applyEye(cam, function(eye, frame, second)
         if vcam.isInside then
             local file = vcam.vehicle ~= nil and vcam.vehicle.configFileName or "unknown"
             return self:getSeatAnchor(vcam), "cab:" .. file
         end
-        if self:holdWorldAnchor(cam, eye, frame) then
+        if self:holdWorldAnchor(cam, eye, frame, second) then
             return self.worldAnchor
         end
         return self:getLevelAnchorForCamera(cam)
@@ -447,9 +450,9 @@ function VRMod:onPlayerCameraUpdated(pc)
     if cam ~= pc.firstPersonCamera and cam ~= pc.thirdPersonCamera and cam ~= pc.thirdPersonConversationCamera then
         return
     end
-    self:applyEye(cam, function(eye, frame)
+    self:applyEye(cam, function(eye, frame, second)
         local offsetKey = cam == pc.firstPersonCamera and "foot" or nil
-        if self:holdWorldAnchor(cam, eye, frame) then
+        if self:holdWorldAnchor(cam, eye, frame, second) then
             return self.worldAnchor, offsetKey
         end
         if cam == pc.firstPersonCamera and pc.pitchNode ~= nil and pc.yawNode ~= nil then

@@ -180,6 +180,10 @@ struct State {
 
 State S;
 
+// Frames alternate between the eyes, and the simulation is frozen on the second frame of each pair.
+int  EyeOfFrame(uint64_t f) { return (int)((f + (uint64_t)g_config.eyeOrder) & 1); }
+bool IsSecondOfPair(uint64_t f) { return ((f + (uint64_t)g_config.syncPhase) & 1) == 1; }
+
 double Seconds(const LARGE_INTEGER& a, const LARGE_INTEGER& b)
 {
     static LARGE_INTEGER f{};
@@ -1026,15 +1030,14 @@ void CopyFrame(IDXGISwapChain* swap)
                 if (S.async) S.eyeValid[rec.eye] = false;  // replaced only when a whole pair is ready
                 S.pairMask = 0;
             }
-            // the eye drawn last in a pair (the frame on which the simulation is frozen)
-            const int closer = 1 ^ (g_config.syncPhase & 1);
-            if (S.async && rec.eye != closer) S.pairMask = 0;  // a new pair starts
+            const bool closer = IsSecondOfPair(rec.frame);  // completes a pair
+            if (S.async && !closer) S.pairMask = 0;  // a new pair starts
             if (CopyToChain(S.eyes[rec.eye], bb, desc.Format, S.calibrating, m, &cursor)) {
                 if (S.async) {  // the compositor submits complete pairs (and sets eyeValid/eyePose)
                     S.pairMask |= 1 << rec.eye;
                     S.pairPose[rec.eye] = rec.pose;
                     S.pairFov[rec.eye] = rec.fov;
-                    if (rec.eye == closer) {
+                    if (closer) {
                         if (S.pairMask == 3) {
                             int set = S.eyes[rec.eye].writeSet;
                             S.readySet = set;
@@ -1484,15 +1487,14 @@ bool GetView(EyeView& out)
         return true;
     }
 
-    int eye = (int)(target & 1);
+    int eye = EyeOfFrame(target);
     XrViewLocateInfo li{XR_TYPE_VIEW_LOCATE_INFO};
     li.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
     li.displayTime = S.predictedTime + (XrTime)(S.lag + (S.async ? 1 : 0)) * S.predictedPeriod;
     // Both eyes of a pair are shown together, so both are predicted for the same display time,
     // like a stereo camera. Otherwise a headset frame starting between the two renders makes the
     // first eye's pose a whole headset frame older than the second's.
-    const int closer = 1 ^ (g_config.syncPhase & 1);
-    if (S.async && eye == closer && S.pairTimeFrame == target - 1) {
+    if (S.async && IsSecondOfPair(target) && S.pairTimeFrame == target - 1) {
         if (li.displayTime != S.pairTime) S.statPairsAligned++;
         li.displayTime = S.pairTime;
     }
@@ -1522,6 +1524,7 @@ bool GetView(EyeView& out)
     out.quat[2] = p.orientation.z;
     out.quat[3] = p.orientation.w;
     out.frame = target;
+    out.second = IsSecondOfPair(target);
     S.cached = out;
     S.cachedFrame = target;
     return true;
@@ -1546,7 +1549,7 @@ bool NextFrameIsSecondEye()
     std::lock_guard<std::recursive_mutex> lock(S.mtx);
     if (!S.running || !S.lastWasStereo) return false;
     uint64_t next = S.presentCount + (uint64_t)S.lag;
-    return ((next + (uint64_t)g_config.syncPhase) & 1) == 1;
+    return IsSecondOfPair(next);
 }
 
 bool IsCalibrating()

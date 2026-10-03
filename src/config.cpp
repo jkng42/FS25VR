@@ -30,6 +30,7 @@ void LoadConfig()
     g_config.fitWindow    = ReadInt(f, L"fitWindow", 1) != 0;
     g_config.syncEyes     = ReadInt(f, L"syncEyes", 1) != 0;
     g_config.syncPhase    = ReadInt(f, L"syncPhase", 0);
+    g_config.eyeOrder     = ReadInt(f, L"eyeOrder", 0) & 1;
     g_config.symmetricFrustum = ReadInt(f, L"symmetricFrustum", 1) != 0;
     g_config.clipMouse    = ReadInt(f, L"clipMouse", 1) != 0;
     g_config.showCursor   = ReadInt(f, L"showCursor", 1) != 0;
@@ -40,7 +41,8 @@ void LoadConfig()
     g_config.debugLog     = ReadInt(f, L"debugLog", 0) != 0;
     if (g_config.worldScale <= 0.01f) g_config.worldScale = 1.0f;
 
-    Log("config: enabled=%d forceNoVsync=%d presentLag=%d worldScale=%.2f menu=%.1fm/%.1fm fitWindow=%d syncEyes=%d/%d debug=%d",
+    Log("config: enabled=%d forceNoVsync=%d presentLag=%d worldScale=%.2f menu=%.1fm/%.1fm fitWindow=%d syncEyes=%d/%d eyeOrder=%d symmetric=%d async=%d debug=%d",
         g_config.enabled, g_config.forceNoVsync, g_config.presentLag, g_config.worldScale,
-        g_config.menuDistance, g_config.menuWidth, g_config.fitWindow, g_config.syncEyes, g_config.syncPhase, g_config.debugLog);
+        g_config.menuDistance, g_config.menuWidth, g_config.fitWindow, g_config.syncEyes, g_config.syncPhase,
+        g_config.eyeOrder, g_config.symmetricFrustum, g_config.asyncSubmit, g_config.debugLog);
 }

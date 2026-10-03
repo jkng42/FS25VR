@@ -10,6 +10,7 @@ struct Config {
     bool  fitWindow       = true;   // shrink a window taller than the screen, keep rendering at full size
     bool  syncEyes        = true;   // freeze the simulation on second-eye frames
     int   syncPhase       = 0;      // 1 = freeze the other parity (if the engine pipelines physics)
+    int   eyeOrder        = 0;      // 0 = left eye on even frames, 1 = right eye on even frames
     bool  symmetricFrustum = true;  // centred per-eye projection (screen-space effects assume it)
     bool  clipMouse       = true;   // keep the cursor inside the game window while it is focused
     bool  showCursor      = true;   // draw the mouse pointer into the headset image

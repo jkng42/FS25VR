@@ -11,6 +11,7 @@ struct EyeView {
     float fovY;          // radians, for setFovY
     float offX, offY;    // for setProjectionOffset
     uint64_t frame;      // present index this view will be shown on
+    bool  second;        // second frame of a stereo pair (the simulation is frozen on it)
 };
 
 namespace vr {

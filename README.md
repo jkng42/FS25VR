@@ -56,6 +56,7 @@ The head position offset is remembered separately for each vehicle's cab and for
 | `symmetricFrustum` | 1 (default): each eye renders a centred frustum enclosing its field of view. The game's ambient occlusion assumes a centred projection, so with the exact off-centre frustum it differs between the eyes. On headsets with offset lenses this costs horizontal pixel density; use the recommended render size to compensate. |
 | `asyncSubmit` | 1 (default): the headset frame loop runs on its own thread |
 | `syncEyes`, `syncPhase` | Freeze the simulation on right-eye frames. If moving objects still look doubled, try `syncPhase=1`. |
+| `eyeOrder` | Which eye is drawn on even frames (0 = left, default). If one eye shimmers or stutters and the other doesn't, try `eyeOrder=1`. |
 | `worldScale` | >1 makes the world feel smaller |
 | `menuDistance`, `menuWidth` | Placement of the flat menu screen (metres) |
 | `fitWindow`, `clipMouse`, `showCursor` | Desktop window fitting, keeping the mouse in the window, pointer in the headset |

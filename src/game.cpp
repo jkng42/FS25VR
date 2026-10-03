@@ -68,7 +68,7 @@ bool ArgBool(lua_State* L, int idx)
 // ---------------------------------------------------------------------------------------------
 // Lua-visible VR API
 
-// vr.getView() -> ok, eye, px, py, pz, qx, qy, qz, qw, fovY, offX, offY, frame
+// vr.getView() -> ok, eye, px, py, pz, qx, qy, qz, qw, fovY, offX, offY, frame, second
 int L_getView(lua_State* L)
 {
     EyeView v;
@@ -84,7 +84,8 @@ int L_getView(lua_State* L)
     PushNumber(L, v.offX);
     PushNumber(L, v.offY);
     PushNumber(L, (double)v.frame);
-    return 13;
+    PushBool(L, v.second);
+    return 14;
 }
 
 int L_isRunning(lua_State* L)
