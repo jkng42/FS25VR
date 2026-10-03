@@ -42,13 +42,13 @@ struct Chain {
     D3D12_CPU_DESCRIPTOR_HANDLE              rtvBase{};
     uint32_t                                 w = 0, h = 0;
 
-    // Async mode: the game thread draws into this texture (never touching the OpenXR swapchain);
-    // the compositor thread copies it into a swapchain image once per headset frame.
-    ID3D12Resource*                          staging = nullptr;   // rests in RENDER_TARGET
-    D3D12_CPU_DESCRIPTOR_HANDLE              stagingRtv{};
-    bool                                     staged = false;      // new image not yet copied
-    XrPosef                                  stagedPose{};
-    XrFovf                                   stagedFov{};
+    // Async mode: the game thread draws into a staging texture (never touching the OpenXR
+    // swapchain); the compositor thread copies it into a swapchain image. Eye chains have two, so
+    // the game can draw the next stereo pair while the compositor still has the last one.
+    ID3D12Resource*                          staging[2] = {};     // rest in RENDER_TARGET
+    D3D12_CPU_DESCRIPTOR_HANDLE              stagingRtv[2]{};
+    int                                      writeSet = 0;        // staging texture the game draws into
+    bool                                     staged = false;      // menu screen: new image not yet copied
 };
 
 struct State {
@@ -101,6 +101,18 @@ struct State {
     bool           lastWasStereo = false;
     bool           showStereo = false;   // newest game frame was a 3D view (else flat menu screen)
     bool           quadValid = false;
+
+    // Async mode hands eyes to the compositor in complete stereo pairs (the two frames between
+    // which the simulation is frozen), so both eyes always change on the same headset refresh.
+    // Latching each eye on its own lets one eye's updates land irregularly on the refreshes
+    // whenever the game runs close to the headset's rate: that eye stutters while the other doesn't.
+    int            pairMask = 0;         // eyes of the pair being drawn (bit per eye)
+    XrPosef        pairPose[2]{};
+    XrFovf         pairFov[2]{};
+    bool           pairReady = false;    // a complete pair waits for the compositor
+    int            readySet = 0;         // staging textures holding it
+    XrPosef        readyPose[2]{};
+    XrFovf         readyFov[2]{};
 
     // async submission: a compositor thread owns the OpenXR frame loop
     bool           async = true;
@@ -245,7 +257,8 @@ XrPosef YawOnly(const XrPosef& p)
 void DestroyChain(Chain& c)
 {
     if (c.handle) xrDestroySwapchain(c.handle);
-    if (c.staging) c.staging->Release();
+    for (auto* t : c.staging)
+        if (t) t->Release();
     c = Chain{};
 }
 
@@ -270,6 +283,8 @@ void DestroySwapchains()
     DestroyChain(S.quad);
     if (S.rtvHeap) S.rtvHeap->Release(), S.rtvHeap = nullptr;
     S.eyeValid[0] = S.eyeValid[1] = false;
+    S.pairReady = false;
+    S.pairMask = 0;
 }
 
 void DestroySession()
@@ -471,9 +486,9 @@ bool InitSession()
     return true;
 }
 
-bool CreateChain(Chain& c, uint32_t w, uint32_t h, UINT rtvOffset, UINT stagingRtvIndex)
+bool CreateChain(Chain& c, uint32_t w, uint32_t h, UINT rtvOffset, UINT stagingRtvIndex, int stagingCount)
 {
-    // staging texture for async submission (same format and size as the swapchain images)
+    // staging textures for async submission (same format and size as the swapchain images)
     D3D12_HEAP_PROPERTIES hp = {D3D12_HEAP_TYPE_DEFAULT};
     D3D12_RESOURCE_DESC td = {};
     td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
@@ -484,18 +499,19 @@ bool CreateChain(Chain& c, uint32_t w, uint32_t h, UINT rtvOffset, UINT stagingR
     td.Format = S.chainFormat;
     td.SampleDesc.Count = 1;
     td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
-    if (FAILED(S.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_RENDER_TARGET,
-                                                 nullptr, IID_PPV_ARGS(&c.staging)))) {
-        Log("could not create staging texture %ux%u", w, h);
-        return false;
-    }
-    c.stagingRtv = S.rtvHeap->GetCPUDescriptorHandleForHeapStart();
-    c.stagingRtv.ptr += (SIZE_T)stagingRtvIndex * S.rtvInc;
-    {
+    for (int i = 0; i < stagingCount; i++) {
+        if (FAILED(S.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td,
+                                                     D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr,
+                                                     IID_PPV_ARGS(&c.staging[i])))) {
+            Log("could not create staging texture %ux%u", w, h);
+            return false;
+        }
+        c.stagingRtv[i] = S.rtvHeap->GetCPUDescriptorHandleForHeapStart();
+        c.stagingRtv[i].ptr += (SIZE_T)(stagingRtvIndex + i) * S.rtvInc;
         D3D12_RENDER_TARGET_VIEW_DESC rd = {};
         rd.Format = S.chainFormat;
         rd.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
-        S.device->CreateRenderTargetView(c.staging, &rd, c.stagingRtv);
+        S.device->CreateRenderTargetView(c.staging[i], &rd, c.stagingRtv[i]);
     }
 
     XrSwapchainCreateInfo ci{XR_TYPE_SWAPCHAIN_CREATE_INFO};
@@ -536,11 +552,12 @@ bool EnsureSwapchains(UINT w, UINT h)
     DestroySwapchains();
     D3D12_DESCRIPTOR_HEAP_DESC hd = {};
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-    hd.NumDescriptors = 27;  // 3 chains x 8 swapchain images + 3 staging textures
+    hd.NumDescriptors = 29;  // 3 chains x 8 swapchain images + 2+2+1 staging textures
     if (FAILED(S.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&S.rtvHeap)))) return false;
     S.rtvInc = S.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-    if (!CreateChain(S.eyes[0], w, h, 0, 24) || !CreateChain(S.eyes[1], w, h, 8, 25) ||
-        !CreateChain(S.quad, w, h, 16, 26))
+    int sets = S.async ? 2 : 0;
+    if (!CreateChain(S.eyes[0], w, h, 0, 24, sets) || !CreateChain(S.eyes[1], w, h, 8, 26, sets) ||
+        !CreateChain(S.quad, w, h, 16, 28, S.async ? 1 : 0))
         return false;
     Log("OpenXR swapchains created %ux%u", w, h);
     return true;
@@ -759,7 +776,7 @@ bool CopyToChain(Chain& chain, ID3D12Resource* bb, DXGI_FORMAT bbFormat, bool sa
 
     D3D12_CPU_DESCRIPTOR_HANDLE rtv = chain.rtvBase;
     rtv.ptr += (SIZE_T)idx * S.rtvInc;
-    if (S.async) rtv = chain.stagingRtv;
+    if (S.async) rtv = chain.stagingRtv[chain.writeSet];
     S.blit.Record(S.cl, bb, bbFormat, rtv, chain.w, chain.h, cursor);
 
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
@@ -1001,15 +1018,32 @@ void CopyFrame(IDXGISwapChain* swap)
             if (S.calibrating && !IsCalibFormat(desc.Format))
                 FinishCalibration("backbuffer format cannot be sampled, keeping configured value");
             Mirror m = EnsureMirror(bb) ? (rec.eye == 0 ? Mirror::Save : Mirror::Restore) : Mirror::None;
-            if (!S.lastWasStereo) {  // stale image from before a menu
+            if (!S.lastWasStereo) {  // stale images from before a menu
                 S.eyeValid[rec.eye ^ 1] = false;
-                S.eyes[rec.eye ^ 1].staged = false;
+                if (S.async) S.eyeValid[rec.eye] = false;  // replaced only when a whole pair is ready
+                S.pairMask = 0;
             }
+            // the eye drawn last in a pair (the frame on which the simulation is frozen)
+            const int closer = 1 ^ (g_config.syncPhase & 1);
+            if (S.async && rec.eye != closer) S.pairMask = 0;  // a new pair starts
             if (CopyToChain(S.eyes[rec.eye], bb, desc.Format, S.calibrating, m, &cursor)) {
-                if (S.async) {  // the compositor submits it (and sets eyeValid/eyePose)
-                    S.eyes[rec.eye].staged = true;
-                    S.eyes[rec.eye].stagedPose = rec.pose;
-                    S.eyes[rec.eye].stagedFov = rec.fov;
+                if (S.async) {  // the compositor submits complete pairs (and sets eyeValid/eyePose)
+                    S.pairMask |= 1 << rec.eye;
+                    S.pairPose[rec.eye] = rec.pose;
+                    S.pairFov[rec.eye] = rec.fov;
+                    if (rec.eye == closer) {
+                        if (S.pairMask == 3) {
+                            int set = S.eyes[rec.eye].writeSet;
+                            S.readySet = set;
+                            for (int e = 0; e < 2; e++) {
+                                S.readyPose[e] = S.pairPose[e];
+                                S.readyFov[e] = S.pairFov[e];
+                                S.eyes[e].writeSet = set ^ 1;  // the next pair goes into the other textures
+                            }
+                            S.pairReady = true;
+                        }
+                        S.pairMask = 0;
+                    }
                 } else {
                     S.eyeValid[rec.eye] = true;
                     S.eyePose[rec.eye] = rec.pose;
@@ -1077,7 +1111,7 @@ void SubmitFrame()
 // Compositor thread: copies each marked staging texture into its acquired swapchain image.
 // Called with the state lock held, so the game thread cannot draw into a staging texture until
 // the copy has been submitted (the GPU executes the queue in submission order).
-int RecordStagingCopies(Chain* chains[3], const bool copy[3], const uint32_t idx[3])
+int RecordStagingCopies(Chain* chains[3], const bool copy[3], const uint32_t idx[3], const int set[3])
 {
     if (!S.cList) {
         for (auto& a : S.cAlloc)
@@ -1101,19 +1135,20 @@ int RecordStagingCopies(Chain* chains[3], const bool copy[3], const uint32_t idx
     for (int i = 0; i < 3; i++) {
         if (!copy[i]) continue;
         ID3D12Resource* img = chains[i]->images[idx[i]];
+        ID3D12Resource* src = chains[i]->staging[set[i]];
         D3D12_RESOURCE_BARRIER b[2] = {};
         for (auto& x : b) {
             x.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
             x.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
         }
-        b[0].Transition.pResource = chains[i]->staging;
+        b[0].Transition.pResource = src;
         b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
         b[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
         b[1].Transition.pResource = img;  // swapchain images are handed out in RENDER_TARGET
         b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
         b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
         S.cList->ResourceBarrier(2, b);
-        S.cList->CopyResource(img, chains[i]->staging);
+        S.cList->CopyResource(img, src);
         std::swap(b[0].Transition.StateBefore, b[0].Transition.StateAfter);
         std::swap(b[1].Transition.StateBefore, b[1].Transition.StateAfter);
         S.cList->ResourceBarrier(2, b);
@@ -1175,7 +1210,8 @@ void CompositorFrame()
     {
         std::lock_guard<std::recursive_mutex> lock(S.mtx);
         S.compUsingChains = true;
-        for (int i = 0; i < 3; i++) copy[i] = chains[i]->staged && chains[i]->handle && chains[i]->staging;
+        for (int i = 0; i < 2; i++) copy[i] = S.pairReady && chains[i]->handle && chains[i]->staging[1];
+        copy[2] = chains[2]->staged && chains[2]->handle && chains[2]->staging[0];
     }
 
     // 2. get free swapchain images (may block on some runtimes - this thread only, never the game)
@@ -1207,14 +1243,17 @@ void CompositorFrame()
     int copied = 0;
     {
         std::lock_guard<std::recursive_mutex> lock(S.mtx);
-        if (copy[0] || copy[1] || copy[2]) copied = RecordStagingCopies(chains, copy, idx);
+        // the newest pair: the game may have published another since step 1 (into the other
+        // staging textures), which is read together with its poses here under the lock
+        const int set[3] = {S.readySet, S.readySet, 0};
+        if (copy[0] || copy[1] || copy[2]) copied = RecordStagingCopies(chains, copy, idx, set);
         for (int e = 0; e < 2; e++)
             if (copy[e]) {
-                S.eyePose[e] = chains[e]->stagedPose;
-                S.eyeFov[e] = chains[e]->stagedFov;
+                S.eyePose[e] = S.readyPose[e];
+                S.eyeFov[e] = S.readyFov[e];
                 S.eyeValid[e] = true;
-                chains[e]->staged = false;
             }
+        if (copy[0] || copy[1]) S.pairReady = false;
         if (copy[2]) {
             S.quadValid = true;
             chains[2]->staged = false;
