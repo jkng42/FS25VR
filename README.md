@@ -29,16 +29,17 @@ To uninstall, double-click **`UNINSTALL.bat`**, or delete `dinput8.dll`, `openxr
 
 ### Linux (Proton)
 
-The mod runs under Proton (tested with GE-Proton 10 and Proton Experimental, WiVRn 26.9 with a Quest 3, AMD RX 9070 XT on CachyOS). The installer scripts are Windows-only, so install by hand:
+The mod runs under Proton (tested with GE-Proton 10 and Proton Experimental, WiVRn 26.9 with a Quest 3, AMD RX 9070 XT on CachyOS).
 
-1. Copy everything in `x64/` into `<game>/x64/`, and `mod/FS25_VR.zip` into the mods folder inside the Proton prefix: `steamapps/compatdata/2300320/pfx/drive_c/users/steamuser/Documents/My Games/FarmingSimulator2025/mods/`.
+1. In the unpacked release, run `bash install.sh`. It finds the game through Steam's library folders (native or Flatpak Steam) and installs into `<game>/x64` and the mods folder inside the game's Proton prefix. `bash install.sh --uninstall` removes it again; `--help` lists the options.
+   - Or by hand: copy everything in `x64/` into `<game>/x64/`, and `mod/FS25_VR.zip` into `steamapps/compatdata/2300320/pfx/drive_c/users/steamuser/Documents/My Games/FarmingSimulator2025/mods/`.
 2. Set the game's Steam launch options so Wine loads the bridge instead of its own `dinput8` and the Steam runtime container sees your OpenXR runtime:
    ```
    WINEDLLOVERRIDES="dinput8=n,b" PRESSURE_VESSEL_IMPORT_OPENXR_1_RUNTIMES=1 %command%
    ```
    Leave out `WINEDLLOVERRIDES` to play flat without the bridge loading at all.
 3. Start the OpenXR runtime (e.g. the WiVRn server) and connect the headset before starting the game.
-4. `SET VR RESOLUTION.bat` does not run on Linux: set the render size in `game.xml` in the same `FarmingSimulator2025` folder (`<width>`/`<height>` under `<display>`, windowed, vsync off), with the game closed. `fs25vr.log` names the recommended size.
+4. For the render size, run `bash install.sh --auto-resolution` after your first VR session (the counterpart of `SET VR RESOLUTION.bat`), or `--resolution 2568x2584` for a size of your choice. It edits `game.xml` in the prefix and keeps a backup.
 
 With a streaming runtime such as WiVRn the headset only gets the stream's resolution: raise it in the WiVRn app on the headset before raising the render size.
 
