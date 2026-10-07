@@ -26,12 +26,11 @@ VRMod.KEY_TOGGLE = Input.KEY_f9 or 290
 VRMod.KEY_SSAO = Input.KEY_f7 or 288
 VRMod.KEY_FRUSTUM = Input.KEY_f6 or 287
 VRMod.KEY_HUD = Input.KEY_f10 or 291
--- Numpad /: alternating eyes <-> plane stereo (both eyes every frame, the right eye as a second
--- view of the engine's main render path)
-VRMod.KEY_PLANE_STEREO = Input.KEY_KP_divide or 267
--- Numpad *: quad views on/off (plane stereo plus a sharper focus view per eye)
-VRMod.KEY_QUAD_VIEWS = Input.KEY_KP_multiply or 268
+-- quad views: plane stereo plus a sharper focus view per eye (chosen in the settings)
 VRMod.quadViews = false
+-- F11: VR settings (stereo mode: alternating eyes, plane stereo, quad views; 3D resolution)
+VRMod.KEY_SETTINGS = Input.KEY_f11 or 292
+VRMod.STEREO_RETRY = 10000           -- ms between automatic plane stereo starts after a failure
 -- The HUD is drawn flat into each eye's image, so in the headset it sits in the corners of your
 -- vision at screen depth. Hidden while the 3D view is in VR (F10 shows it again).
 VRMod.hideHud = true
@@ -84,6 +83,17 @@ function VRMod:loadMap(name)
 
     self:installHooks()
     self:loadOffsets()
+    if self.settings.renderScale ~= nil and set3dResolutionScaling ~= nil then
+        set3dResolutionScaling(self.settings.renderScale)
+    end
+    local okGui, err = pcall(function()
+        local dialog = VRSettingsDialog.new()
+        dialog.mod = self
+        g_gui:loadGui(self.modDirectory .. "gui/VRSettingsDialog.xml", "VRSettingsDialog", dialog)
+    end)
+    if not okGui then
+        log("settings menu not available: %s", tostring(err))
+    end
 
     self.eyeNode = createTransformGroup("vrEye")
     link(getRootNode(), self.eyeNode)
@@ -481,6 +491,7 @@ end
 
 function VRMod:loadOffsets()
     self.offsets = {}
+    self.settings = {stereoMode = VRSettingsDialog.MODE_ALTERNATING}
     local ok, err = pcall(function()
         local path = offsetFile()
         if not fileExists(path) then
@@ -501,6 +512,11 @@ function VRMod:loadOffsets()
                 getXMLFloat(xml, key .. "#z") or 0}
             i = i + 1
         end
+        local mode = getXMLInt(xml, "fs25vr.settings#stereoMode")
+        if mode ~= nil and mode >= 1 and mode <= 3 then
+            self.settings.stereoMode = mode
+        end
+        self.settings.renderScale = getXMLFloat(xml, "fs25vr.settings#renderScale")
         delete(xml)
     end)
     if not ok then
@@ -530,6 +546,10 @@ function VRMod:saveOffsets()
             setXMLFloat(xml, key .. "#x", o[1])
             setXMLFloat(xml, key .. "#y", o[2])
             setXMLFloat(xml, key .. "#z", o[3])
+        end
+        setXMLInt(xml, "fs25vr.settings#stereoMode", self.settings.stereoMode)
+        if self.settings.renderScale ~= nil then
+            setXMLFloat(xml, "fs25vr.settings#renderScale", self.settings.renderScale)
         end
         saveXMLFile(xml)
         delete(xml)
@@ -608,6 +628,16 @@ function VRMod:update(dt)
     self:updateHud(running and self:isStereoAllowed())
     self:updateOffset(dt)
     self:updatePlaneStereo(dt)
+    -- the stereo mode chosen in the settings: plane stereo starts by itself once VR shows the 3D view
+    -- and the bridge has measured the frame latency (it needs alternating eyes for that)
+    self.stereoRetry = math.max(0, (self.stereoRetry or 0) - dt)
+    if running and self.planeStereo == nil and self.stereoRetry == 0 and
+        self.settings.stereoMode ~= VRSettingsDialog.MODE_ALTERNATING and self:isStereoAllowed() and
+        not self.api.calibrating() then
+        self.stereoRetry = VRMod.STEREO_RETRY
+        VRMod.quadViews = self.settings.stereoMode == VRSettingsDialog.MODE_QUAD
+        self:startPlaneStereo()
+    end
 
     -- leaving stereo (menus, toggle): give the camera its normal projection back
     if not self:isStereoAllowed() then
@@ -679,10 +709,10 @@ function VRMod:keyEvent(unicode, sym, modifier, isDown)
         VRMod.symmetric = not VRMod.symmetric
         self.api.setSymmetric(VRMod.symmetric)
         self:showMessage(VRMod.symmetric and "Projection: centred" or "Projection: off-centre (exact)")
-    elseif sym == VRMod.KEY_PLANE_STEREO then
-        self:togglePlaneStereo()
-    elseif sym == VRMod.KEY_QUAD_VIEWS then
-        self:toggleQuadViews()
+    elseif sym == VRMod.KEY_SETTINGS then
+        if g_gui ~= nil and not g_gui:getIsGuiVisible() and g_gui.guis["VRSettingsDialog"] ~= nil then
+            g_gui:showDialog("VRSettingsDialog")
+        end
     elseif sym == VRMod.KEY_HUD then
         VRMod.hideHud = not VRMod.hideHud
         self:showMessage(VRMod.hideHud and "HUD hidden in VR" or "HUD shown in VR")
@@ -717,22 +747,42 @@ local function bestAtmosphereQuality()
     return best
 end
 
-function VRMod:togglePlaneStereo()
-    if self.planeStereo ~= nil then
-        self:stopPlaneStereo()
-        self:showMessage("Stereo: alternating eyes")
-        return
-    end
-    self:startPlaneStereo()
+function VRMod:getStereoMode()
+    return self.settings.stereoMode
 end
 
--- Quad views: plane stereo with two more render overlays, the left and right focus views
-function VRMod:toggleQuadViews()
-    VRMod.quadViews = not VRMod.quadViews
-    if self.planeStereo ~= nil then
-        self:stopPlaneStereo()
+-- the game's 3D resolution scaling: every view renders at the window's size times it
+function VRMod:getRenderScale()
+    if self.settings.renderScale ~= nil then
+        return self.settings.renderScale
     end
-    self:startPlaneStereo()
+    return get3dResolutionScaling ~= nil and get3dResolutionScaling() or 1
+end
+
+-- from the settings menu
+function VRMod:applySettings(mode, scale)
+    local scaleChanged = math.abs(scale - self:getRenderScale()) > 0.001
+    self.settings.stereoMode = mode
+    self.settings.renderScale = scale
+    self:saveOffsets()
+    if scaleChanged and set3dResolutionScaling ~= nil then
+        set3dResolutionScaling(scale)
+    end
+    local quad = mode == VRSettingsDialog.MODE_QUAD
+    if mode == VRSettingsDialog.MODE_ALTERNATING then
+        if self.planeStereo ~= nil then
+            self:stopPlaneStereo()
+            self:showMessage("Stereo: alternating eyes")
+        end
+    elseif self.planeStereo ~= nil and (quad ~= VRMod.quadViews or scaleChanged) then
+        -- the views' render targets change size: new overlays
+        VRMod.quadViews = quad
+        self:stopPlaneStereo()
+        self:startPlaneStereo()
+    end
+    -- otherwise plane stereo starts by itself (VRMod:update)
+    VRMod.quadViews = quad
+    self.stereoRetry = 0
 end
 
 function VRMod:startPlaneStereo()
@@ -740,7 +790,7 @@ function VRMod:startPlaneStereo()
         self:showMessage("Plane stereo: bridge too old")
         return
     end
-    local sizes = {self.api.prepareOverlay(true, VRMod.quadViews)}
+    local sizes = {self.api.prepareOverlay(true, VRMod.quadViews, self:getRenderScale())}
     if sizes[1] == nil or sizes[1] == 0 then
         self:showMessage("Plane stereo: VR not running")
         return

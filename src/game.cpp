@@ -89,13 +89,14 @@ int L_getView(lua_State* L)
     return 14;
 }
 
-// vr.prepareOverlay(on, quad) -> width, height, ...: the sizes to create the render overlays for plane
+// vr.prepareOverlay(on, quad, renderScale) -> width, height, ...: the sizes to create the render overlays for plane
 // stereo with (one pair per overlay: the right eye; with quad views also the left and right focus
 // views; 0, 0 = off); the bridge watches for the render targets of those sizes
 int L_prepareOverlay(lua_State* L)
 {
     uint32_t w[3] = {}, h[3] = {};
-    int n = vr::PrepareOverlay(ArgBool(L, 1), ArgBool(L, 2), w, h);
+    float scale = GetTop(L) >= 3 && Base(L)[2].tt == LUA_TNUMBER ? (float)Base(L)[2].value.n : 1.0f;
+    int n = vr::PrepareOverlay(ArgBool(L, 1), ArgBool(L, 2), scale > 0.1f ? scale : 1.0f, w, h);
     for (int i = 0; i < (n ? n : 1); i++) {
         PushNumber(L, w[i]);
         PushNumber(L, h[i]);
@@ -109,6 +110,19 @@ int L_setPlaneStereo(lua_State* L)
 {
     PushBool(L, vr::SetPlaneStereo(ArgBool(L, 1)));
     return 1;
+}
+
+// vr.headsetInfo() -> recommended width, height per eye, focus view share of the field of view (w, h)
+int L_headsetInfo(lua_State* L)
+{
+    uint32_t w = 0, h = 0;
+    float fw = 0, fh = 0;
+    vr::HeadsetInfo(w, h, fw, fh);
+    PushNumber(L, w);
+    PushNumber(L, h);
+    PushNumber(L, fw);
+    PushNumber(L, fh);
+    return 4;
 }
 
 int L_isRunning(lua_State* L)
@@ -158,6 +172,7 @@ int Hook_setStereoRendering(lua_State* L)
         {"status", L_status},
         {"prepareOverlay", L_prepareOverlay},
         {"setPlaneStereo", L_setPlaneStereo},
+        {"headsetInfo", L_headsetInfo},
     };
     lua_createtable(L, 0, (int)std::size(funcs) + 1);
     for (auto& f : funcs) {

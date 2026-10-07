@@ -1693,7 +1693,7 @@ void SetSymmetricFrustum(bool on)
     Log("symmetric frustum %s", on ? "on" : "off");
 }
 
-int PrepareOverlay(bool on, bool quad, uint32_t w[3], uint32_t h[3])
+int PrepareOverlay(bool on, bool quad, float renderScale, uint32_t w[3], uint32_t h[3])
 {
     std::lock_guard<std::recursive_mutex> lock(S.mtx);
     if (S.planeStereo) {
@@ -1707,16 +1707,16 @@ int PrepareOverlay(bool on, bool quad, uint32_t w[3], uint32_t h[3])
         S.ovCount = 1;
         S.ovW[0] = S.bbW + 32;
         S.ovH[0] = S.bbH;
-        if (quad && S.recW && S.pairViewFrame != ~0ull) {
-            // the focus views at the configured multiple of the headset's recommended pixel density
-            for (int e = 0; e < 2; e++) {
-                const XrFovf& eye = S.pairViews[e].fov;
-                XrFovf f = FocusFov(eye);
-                float density =
-                    g_config.quadFocusDensity * (float)S.recW / (tanf(eye.angleRight) - tanf(eye.angleLeft));
-                S.ovW[1 + e] = (((UINT)(density * (tanf(f.angleRight) - tanf(f.angleLeft))) + 7) & ~7u) + 8 * e;
-                S.ovH[1 + e] = ((UINT)(density * (tanf(f.angleUp) - tanf(f.angleDown))) + 7) & ~7u;
-            }
+        if (quad) {
+            // The engine renders every view at its render resolution (the window's times the 3D
+            // resolution scaling) and scales the result to the view's size: the focus views get that
+            // resolution, so their narrower field of view has the higher density
+            UINT rw = (UINT)((float)S.bbW * renderScale + 0.5f), rh = (UINT)((float)S.bbH * renderScale + 0.5f);
+            S.ovW[1] = rw + 16;
+            S.ovW[2] = rw + 48;
+            S.ovH[1] = S.ovH[2] = rh;
+            for (int e = 1; e < 3; e++)
+                while (S.ovW[e] == S.ovW[0] && S.ovH[e] == S.ovH[0]) S.ovW[e] += 8;
             S.ovCount = 3;
         }
     }
@@ -1728,8 +1728,8 @@ int PrepareOverlay(bool on, bool quad, uint32_t w[3], uint32_t h[3])
     overlay::SetSizes(S.ovCount, S.ovW, S.ovH);
     if (S.ovCount == 3)
         Log("stereo overlays prepared: right eye %ux%u, focus views %ux%u / %ux%u (%.2f x %.2f of the field of view, "
-            "%.2fx density)", S.ovW[0], S.ovH[0], S.ovW[1], S.ovH[1], S.ovW[2], S.ovH[2], g_config.quadFocusWidth,
-            g_config.quadFocusHeight, g_config.quadFocusDensity);
+            "render scale %.2f)", S.ovW[0], S.ovH[0], S.ovW[1], S.ovH[1], S.ovW[2], S.ovH[2], g_config.quadFocusWidth,
+            g_config.quadFocusHeight, renderScale);
     else
         Log("stereo overlay %s (%ux%u)", S.ovCount ? "prepared" : "off", w[0], h[0]);
     return S.ovCount;
@@ -1746,6 +1746,15 @@ bool SetPlaneStereo(bool on)
     S.planeStereo = on && ok;
     S.cachedFrame = ~0ull;
     return ok;
+}
+
+void HeadsetInfo(uint32_t& recW, uint32_t& recH, float& focusW, float& focusH)
+{
+    std::lock_guard<std::recursive_mutex> lock(S.mtx);
+    recW = S.recW;
+    recH = S.recH;
+    focusW = g_config.quadFocusWidth;
+    focusH = g_config.quadFocusHeight;
 }
 
 void RequestRecenter()

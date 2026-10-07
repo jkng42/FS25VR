@@ -42,7 +42,6 @@ void LoadConfig()
     g_config.debugLog     = ReadInt(f, L"debugLog", 0) != 0;
     g_config.quadFocusWidth   = std::clamp(ReadFloat(f, L"quadFocusWidth", 0.5f), 0.1f, 1.0f);
     g_config.quadFocusHeight  = std::clamp(ReadFloat(f, L"quadFocusHeight", 0.45f), 0.1f, 1.0f);
-    g_config.quadFocusDensity = std::clamp(ReadFloat(f, L"quadFocusDensity", 1.6f), 0.25f, 3.0f);
     g_config.quadFocusSmoothing = std::clamp(ReadFloat(f, L"quadFocusSmoothing", 0.18f), 0.0f, 0.5f);
     if (g_config.worldScale <= 0.01f) g_config.worldScale = 1.0f;
 
@@ -50,6 +49,6 @@ void LoadConfig()
         g_config.enabled, g_config.forceNoVsync, g_config.presentLag, g_config.worldScale,
         g_config.menuDistance, g_config.menuWidth, g_config.fitWindow, g_config.syncEyes, g_config.syncPhase,
         g_config.eyeOrder, g_config.symmetricFrustum, g_config.asyncSubmit, g_config.debugLog);
-    Log("config: quad views focus %.2f x %.2f of the field of view, %.2fx density, edge %.2f",
-        g_config.quadFocusWidth, g_config.quadFocusHeight, g_config.quadFocusDensity, g_config.quadFocusSmoothing);
+    Log("config: quad views focus %.2f x %.2f of the field of view, edge %.2f", g_config.quadFocusWidth,
+        g_config.quadFocusHeight, g_config.quadFocusSmoothing);
 }
