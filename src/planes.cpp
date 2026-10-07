@@ -262,6 +262,12 @@ void* Hook_GetPlanes(char* mgr, void* window, float aspect)
 //   context setup:     call (rcx = context, dl = view flags bit 0x10)
 //                      -> for an eye light view's context: dl = 1, [context+0x30] = 1
 //   cascade creation:  2 calls inside the setup (rdi = context) -> skipped for it
+// The setup also hands the context's shadow-casting lights to the shared shadow atlas (local lights
+// as requests in a shared list, then the atlas packer): for the eye light views that would request
+// every lamp's shadow again and repack the atlas after the scene view (black tiles, the sun's
+// shadow tiles moving: shadow bars). Their contexts look the cascades up anyway, so for them
+//   local shadow light:  "cmp ecx, 2 ; jne next" (light type) -> always next
+//   atlas packer:        call (rdi = context) -> skipped
 BYTE* AllocNear(BYTE* site, size_t size)
 {
     SYSTEM_INFO si;
@@ -340,11 +346,14 @@ bool InstallSunShadows()
         "8B 90 F8 03 00 00 4C 8D 80 10 01 00 00 8B 87 94 03 00 00 C1 EA 04 80 E2 01 89 44 24 20 E8");
     BYTE* create1 = GameFindPattern("45 8B CF 4D 8B 46 F8 41 8B 16 48 8B 49 58 E8");
     BYTE* create2 = GameFindPattern("C7 44 24 20 FF FF FF FF 45 8B CD 4D 8B 46 F8 48 8B 49 58 E8");
-    if (!pass || !setup || !create1 || !create2) {
-        Log("planes: sun shadow sites not found (%p %p %p %p): right eye without sun shadows", pass, setup,
-            create1, create2);
+    BYTE* localLight = GameFindPattern("83 F9 02 0F 85 ?? ?? ?? ?? F3 0F 10 42 18 0F 2F C6");
+    BYTE* packer = GameFindPattern("48 8B 8F D8 00 00 00 48 8B 49 58 E8 ?? ?? ?? ?? 8B DE 89 5C 24 54");
+    if (!pass || !setup || !create1 || !create2 || !localLight || !packer) {
+        Log("planes: sun shadow sites not found (%p %p %p %p %p %p): right eye without sun shadows", pass, setup,
+            create1, create2, localLight, packer);
         return false;
     }
+    packer += 11;
     pass += 25;
     setup += 29;
     create1 += 14;
@@ -431,17 +440,58 @@ bool InstallSunShadows()
     e.land(c1);
     e.land(c2);
     e.jmpAbs(createTarget);
+
+    // the packer: skipped for an eye context
+    BYTE* packerThunk = mem + 0x300;
+    BYTE* packerTarget = packer + 5 + *(int32_t*)(packer + 1);
+    e.p = packerThunk;
+    auto [p1, p2] = isEye(0x7A);                      // rdi
+    e.b({0xC3});                                      // ret
+    e.land(p1);
+    e.land(p2);
+    e.jmpAbs(packerTarget);
+
+    // the light type check (9 bytes) becomes a call here: an eye context goes on with the next light
+    BYTE* localThunk = mem + 0x380;
+    BYTE* nextLight = localLight + 9 + *(int32_t*)(localLight + 5);
+    BYTE* shadowLight = localLight + 9;
+    e.p = localThunk;
+    e.b({0x58});                                      // pop rax (the call's return address)
+    auto [l1, l2] = isEye(0x7A);                      // rdi
+    e.jmpAbs(nextLight);
+    e.land(l1);
+    e.land(l2);
+    e.b({0x83, 0xF9, 0x02});                          // cmp ecx, 2
+    BYTE* notLocal = e.jcc(0x75);                     // jne next
+    e.jmpAbs(shadowLight);
+    e.land(notLocal);
+    e.jmpAbs(nextLight);
     FlushInstructionCache(GetCurrentProcess(), mem, 4096);
 
+    int64_t rel = (int64_t)(localThunk - (localLight + 5));
+    DWORD old;
+    if (rel != (int32_t)rel || !VirtualProtect(localLight, 9, PAGE_EXECUTE_READWRITE, &old)) {
+        Log("planes: sun shadow light site could not be patched");
+        return false;
+    }
+    BYTE call[9] = {0xE8, 0, 0, 0, 0, 0x90, 0x90, 0x90, 0x90};
+    int32_t rel32 = (int32_t)rel;
+    memcpy(call + 1, &rel32, 4);
+    memcpy(localLight, call, sizeof(call));
+    VirtualProtect(localLight, 9, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), localLight, 9);
     if (!RedirectCall(pass, passThunk) || !RedirectCall(setup, setupThunk) ||
-        !RedirectCall(create1, createThunk) || !RedirectCall(create2, createThunk)) {
+        !RedirectCall(create1, createThunk) || !RedirectCall(create2, createThunk) ||
+        !RedirectCall(packer, packerThunk)) {
         Log("planes: sun shadow call sites could not be redirected");
         return false;
     }
     BYTE* base = (BYTE*)GetModuleHandleW(nullptr);
-    Log("planes: eye light view sun shadows: light pass +%llx, context setup +%llx, cascades +%llx/+%llx",
+    Log("planes: eye light view sun shadows: light pass +%llx, context setup +%llx, cascades +%llx/+%llx, "
+        "shadow lights +%llx, atlas +%llx",
         (unsigned long long)(pass - base), (unsigned long long)(setup - base), (unsigned long long)(create1 - base),
-        (unsigned long long)(create2 - base));
+        (unsigned long long)(create2 - base), (unsigned long long)(localLight - base),
+        (unsigned long long)(packer - base));
     return true;
 }
 
