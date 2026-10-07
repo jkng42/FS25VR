@@ -3,6 +3,7 @@
 #include "hooks.h"
 #include "log.h"
 #include "xr.h"
+#include "planes.h"
 
 #include <windows.h>
 #include <cstring>
@@ -88,6 +89,25 @@ int L_getView(lua_State* L)
     return 14;
 }
 
+// vr.prepareOverlay(on) -> width, height: the size to create the render overlay for plane stereo
+// with (0 = off); the bridge watches for the render targets of that size
+int L_prepareOverlay(lua_State* L)
+{
+    uint32_t w = 0, h = 0;
+    vr::PrepareOverlay(ArgBool(L, 1), w, h);
+    PushNumber(L, w);
+    PushNumber(L, h);
+    return 2;
+}
+
+// vr.setPlaneStereo(on) -> ok: the render overlay just queued with updateRenderOverlay becomes the
+// output of a second engine view (the right eye through the main render path)
+int L_setPlaneStereo(lua_State* L)
+{
+    PushBool(L, vr::SetPlaneStereo(ArgBool(L, 1)));
+    return 1;
+}
+
 int L_isRunning(lua_State* L)
 {
     PushBool(L, vr::IsRunning());
@@ -133,6 +153,8 @@ int Hook_setStereoRendering(lua_State* L)
         {"calibrating", L_calibrating},
         {"setSymmetric", L_setSymmetric},
         {"status", L_status},
+        {"prepareOverlay", L_prepareOverlay},
+        {"setPlaneStereo", L_setPlaneStereo},
     };
     lua_createtable(L, 0, (int)std::size(funcs) + 1);
     for (auto& f : funcs) {
@@ -299,6 +321,11 @@ void LogGameBuild()
 
 } // namespace
 
+uint8_t* GameFindPattern(const char* pattern)
+{
+    return FindSections() ? FindPattern(pattern) : nullptr;
+}
+
 bool InstallGamePatches(bool final)
 {
     static bool done = false, logged = false;
@@ -350,6 +377,8 @@ bool InstallGamePatches(bool final)
     bool ok = WriteJump(stereo.wrapper, (void*)Hook_setStereoRendering) &&
               WriteJump(headTracking.wrapper, (void*)Hook_isHeadTrackingAvailable);
     Log("game: binding patches %s", ok ? "installed" : "FAILED");
+
+    planes::Install();
     done = ok;
     return ok;
 }

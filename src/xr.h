@@ -27,6 +27,12 @@ bool IsRunning();
 bool GetView(EyeView& out);
 void RequestRecenter();
 void SetSymmetricFrustum(bool on);
+// Plane stereo, step 1: the size the Lua mod must create its render overlay with (0 = off); the
+// bridge watches for that overlay's render targets. Off also ends plane stereo.
+void PrepareOverlay(bool on, uint32_t& w, uint32_t& h);
+// Step 2, once the overlay has rendered by itself: the right eye through the engine's main render
+// path, into the render overlay just queued. Returns false if unavailable.
+bool SetPlaneStereo(bool on);
 bool IsCalibrating();
 bool NextFrameIsSecondEye();  // main thread, before the frame runs  // the mod should draw the latency marker this frame
 const char* Status();

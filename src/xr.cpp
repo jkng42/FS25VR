@@ -10,6 +10,8 @@
 #include "xr.h"
 #include "blit.h"
 #include "config.h"
+#include "overlay.h"
+#include "planes.h"
 #include "log.h"
 #include "profile.h"
 #include "window.h"
@@ -34,6 +36,9 @@ struct FrameRecord {
     int      eye = 0;
     XrPosef  pose{};   // raw LOCAL-space pose the image is rendered from
     XrFovf   fov{};    // frustum actually rendered (may be wider than the eye's)
+    bool     hasOther = false; // plane stereo: the right eye, rendered as the engine's second view
+    XrPosef  otherPose{};
+    XrFovf   otherFov{};
 };
 
 struct Chain {
@@ -113,6 +118,10 @@ struct State {
     XrView         pairViews[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};  // the pair's view query
     XrTime         pairTime = 0;         // display time it was made for
     uint64_t       pairViewFrame = ~0ull;
+    // Plane stereo: the left eye is the game camera every frame, the right eye a second view of the
+    // engine's main render path into a render overlay's texture, so every frame is a stereo pair
+    bool           planeStereo = false;
+    UINT           ovW = 0, ovH = 0;         // the render overlay's size (0 = none)
     int            readySet = 0;         // staging textures holding it
     XrPosef        readyPose[2]{};
     XrFovf         readyFov[2]{};
@@ -723,7 +732,8 @@ void RecordMirror(ID3D12Resource* bb, Mirror mode)
 }
 
 bool CopyToChain(Chain& chain, ID3D12Resource* bb, DXGI_FORMAT bbFormat, bool sampleMarker = false,
-                 Mirror mirror = Mirror::None, const CursorDraw* cursor = nullptr)
+                 Mirror mirror = Mirror::None, const CursorDraw* cursor = nullptr,
+                 D3D12_RESOURCE_STATES srcState = D3D12_RESOURCE_STATE_PRESENT)
 {
     // Async mode draws into the chain's staging texture and never calls OpenXR here: on some
     // runtimes (Quest via Steam Link) swapchain calls block until the next headset refresh, which
@@ -758,8 +768,9 @@ bool CopyToChain(Chain& chain, ID3D12Resource* bb, DXGI_FORMAT bbFormat, bool sa
     b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     b.Transition.pResource = bb;
     b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    b.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+    b.Transition.StateBefore = srcState;
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    const bool transition = srcState != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
 
     int markerSlot = -1;
     if (sampleMarker && S.readback && S.sampleCount < 8 && IsCalibFormat(bbFormat)) {
@@ -780,7 +791,7 @@ bool CopyToChain(Chain& chain, ID3D12Resource* bb, DXGI_FORMAT bbFormat, bool sa
         b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
         b.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     }
-    S.cl->ResourceBarrier(1, &b);
+    if (transition || markerSlot >= 0) S.cl->ResourceBarrier(1, &b);
 
     D3D12_CPU_DESCRIPTOR_HANDLE rtv = chain.rtvBase;
     rtv.ptr += (SIZE_T)idx * S.rtvInc;
@@ -788,8 +799,8 @@ bool CopyToChain(Chain& chain, ID3D12Resource* bb, DXGI_FORMAT bbFormat, bool sa
     S.blit.Record(S.cl, bb, bbFormat, rtv, chain.w, chain.h, cursor);
 
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-    b.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
-    S.cl->ResourceBarrier(1, &b);
+    b.Transition.StateAfter = srcState;
+    if (transition) S.cl->ResourceBarrier(1, &b);
     RecordMirror(bb, mirror);
     S.cl->Close();
     ID3D12CommandList* lists[] = {S.cl};
@@ -965,6 +976,7 @@ void OnSwapChainCreated(ID3D12CommandQueue* queue, IDXGISwapChain* swap)
         S.queue = queue;
     }
     Log("swap chain created (queue %p, device %p)", queue, dev);
+    overlay::Install(dev);
     prof::Init(dev, queue);
     prof::HookQueue(queue);
 }
@@ -985,6 +997,7 @@ void OnPresent(IDXGISwapChain* swap)
         S.tGame += S.cur.game;
     }
     prof::GameWorkDone(S.curFrame);
+    overlay::OnFrameEnd();
     OnPresentImpl(swap, onPresentStart);
     prof::VrWorkDone(S.curFrame);
     S.tPresentStart = Now();
@@ -1033,7 +1046,38 @@ void CopyFrame(IDXGISwapChain* swap)
             }
             const bool closer = IsSecondOfPair(rec.frame);  // completes a pair
             if (S.async && !closer) S.pairMask = 0;  // a new pair starts
-            if (CopyToChain(S.eyes[rec.eye], bb, desc.Format, S.calibrating, m, &cursor)) {
+            DXGI_FORMAT ovFormat = DXGI_FORMAT_UNKNOWN;
+            D3D12_RESOURCE_STATES ovState = D3D12_RESOURCE_STATE_COMMON;
+            ID3D12Resource* ovImage = rec.hasOther && S.async && !S.calibrating ? overlay::Image(ovFormat, ovState)
+                                                                                 : nullptr;
+            if (rec.hasOther && !ovImage) {
+                // plane stereo, but no right-eye image (yet): keep showing the last pair
+                S.pairMask = 0;
+            } else if (ovImage) {
+                // both eyes of this frame: the window's image and the overlay texture's
+                // The main pipeline writes its already encoded output through the texture's sRGB
+                // view, encoding twice: read through the sRGB view.
+                if (ovFormat == DXGI_FORMAT_R8G8B8A8_TYPELESS) ovFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+                if (ovFormat == DXGI_FORMAT_B8G8R8A8_TYPELESS) ovFormat = DXGI_FORMAT_B8G8R8A8_UNORM;
+                if (ovFormat == DXGI_FORMAT_R10G10B10A2_TYPELESS) ovFormat = DXGI_FORMAT_R10G10B10A2_UNORM;
+                bool okL = CopyToChain(S.eyes[0], bb, desc.Format, false, m, &cursor);
+                // Plane stereo renders the right eye from the left eye's camera moved by the eye
+                // offset, without the (tiny) rotation between the eyes: shown with that pose.
+                XrPosef otherPose = rec.otherPose;
+                otherPose.orientation = rec.pose.orientation;
+                bool okR = okL && CopyToChain(S.eyes[1], ovImage, ovFormat, false, Mirror::None, nullptr, ovState);
+                if (okL && okR) {
+                    int set = S.eyes[0].writeSet;
+                    S.readySet = set;
+                    S.readyPose[0] = rec.pose;
+                    S.readyFov[0] = rec.fov;
+                    S.readyPose[1] = otherPose;
+                    S.readyFov[1] = rec.otherFov;
+                    S.eyes[0].writeSet = S.eyes[1].writeSet = set ^ 1;
+                    S.pairReady = true;
+                }
+                S.pairMask = 0;
+            } else if (CopyToChain(S.eyes[rec.eye], bb, desc.Format, S.calibrating, m, &cursor)) {
                 if (S.async) {  // the compositor submits complete pairs (and sets eyeValid/eyePose)
                     S.pairMask |= 1 << rec.eye;
                     S.pairPose[rec.eye] = rec.pose;
@@ -1488,7 +1532,8 @@ bool GetView(EyeView& out)
         return true;
     }
 
-    int eye = EyeOfFrame(target);
+    const bool ovStereo = S.planeStereo && S.ovW && S.ovH;
+    int eye = ovStereo ? 0 : EyeOfFrame(target);
     XrViewLocateInfo li{XR_TYPE_VIEW_LOCATE_INFO};
     li.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
     li.displayTime = S.predictedTime + (XrTime)(S.lag + (S.async ? 1 : 0)) * S.predictedPeriod;
@@ -1498,7 +1543,7 @@ bool GetView(EyeView& out)
     // between the two renders, display times a whole headset frame apart); streaming runtimes that
     // reproject with a single head pose then show the other eye jittering.
     XrView views[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
-    if (S.async && IsSecondOfPair(target) && S.pairViewFrame == target - 1) {
+    if (S.async && !ovStereo && IsSecondOfPair(target) && S.pairViewFrame == target - 1) {
         views[0] = S.pairViews[0];
         views[1] = S.pairViews[1];
         if (li.displayTime != S.pairTime) S.statPairsAligned++;
@@ -1519,6 +1564,20 @@ bool GetView(EyeView& out)
     rec.eye = eye;
     rec.pose = views[eye].pose;
     ComputeProjection(views[eye].fov, (float)S.bbW / (float)S.bbH, out, rec.fov);
+    rec.hasOther = ovStereo;
+    if (ovStereo) {
+        // the right eye as the engine's second view (the overlay texture's aspect), offset from the
+        // left eye's camera
+        EyeView o{};
+        rec.otherPose = views[1].pose;
+        ComputeProjection(views[1].fov, (float)S.ovW / (float)S.ovH, o, rec.otherFov);
+        float sc = g_config.worldScale;
+        XrPosef rel = PoseCompose(PoseInverse(views[0].pose), views[1].pose);
+        float off[3] = {rel.position.x * sc, rel.position.y * sc, rel.position.z * sc};
+        float tans[4] = {tanf(rec.otherFov.angleLeft), tanf(rec.otherFov.angleRight), tanf(rec.otherFov.angleDown),
+                         tanf(rec.otherFov.angleUp)};
+        planes::SetOtherEye(off, tans);
+    }
 
     XrPosef p = PoseCompose(PoseInverse(S.recenter), views[eye].pose);
     float s = g_config.worldScale;
@@ -1531,7 +1590,7 @@ bool GetView(EyeView& out)
     out.quat[2] = p.orientation.z;
     out.quat[3] = p.orientation.w;
     out.frame = target;
-    out.second = IsSecondOfPair(target);
+    out.second = !ovStereo && IsSecondOfPair(target);
     S.cached = out;
     S.cachedFrame = target;
     return true;
@@ -1545,6 +1604,37 @@ void SetSymmetricFrustum(bool on)
     Log("symmetric frustum %s", on ? "on" : "off");
 }
 
+void PrepareOverlay(bool on, uint32_t& w, uint32_t& h)
+{
+    std::lock_guard<std::recursive_mutex> lock(S.mtx);
+    if (!on && S.planeStereo) {
+        planes::SetStereo(false);
+        S.planeStereo = false;
+    }
+    overlay::LockImage(false);
+    // a width no game render target has
+    S.ovW = on && S.bbW && S.bbH ? S.bbW + 32 : 0;
+    S.ovH = S.ovW ? S.bbH : 0;
+    S.cachedFrame = ~0ull;
+    overlay::SetSize(S.ovW, S.ovH);
+    w = S.ovW;
+    h = S.ovH;
+    Log("stereo overlay %s (%ux%u)", S.ovW ? "prepared" : "off", S.ovW, S.ovH);
+}
+
+bool SetPlaneStereo(bool on)
+{
+    std::lock_guard<std::recursive_mutex> lock(S.mtx);
+    if (on && !S.ovW) return false;
+    bool ok = planes::SetStereo(on);
+    // the overlay's own output texture (it rendered by itself until now) stays the right eye's
+    // image; the second view's pipeline creates more targets of that size
+    overlay::LockImage(on && ok);
+    S.planeStereo = on && ok;
+    S.cachedFrame = ~0ull;
+    return ok;
+}
+
 void RequestRecenter()
 {
     std::lock_guard<std::recursive_mutex> lock(S.mtx);
@@ -1556,7 +1646,7 @@ bool NextFrameIsSecondEye()
     std::lock_guard<std::recursive_mutex> lock(S.mtx);
     if (!S.running || !S.lastWasStereo) return false;
     uint64_t next = S.presentCount + (uint64_t)S.lag;
-    return IsSecondOfPair(next);
+    return !S.planeStereo && IsSecondOfPair(next);
 }
 
 bool IsCalibrating()
