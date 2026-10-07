@@ -124,10 +124,9 @@ struct State {
     // engine's main render path into a render overlay's texture, so every frame is a stereo pair
     bool           planeStereo = false;
     // Quad views: two more engine views, a narrower field of view at a higher pixel density per eye,
-    // laid over the eyes' images (scaled up to the focus views' density) before they are submitted
+    // laid over the eyes' images (at the headset's recommended density) before they are submitted
     int            ovCount = 0;              // render overlays: 1 = right eye, 3 = + both focus views
     UINT           ovW[3] = {}, ovH[3] = {};  // their sizes
-    UINT           quadW = 0, quadH = 0;      // the eyes' swapchains with quad views
     int            readySet = 0;         // staging textures holding it
     XrPosef        readyPose[2]{};
     XrFovf         readyFov[2]{};
@@ -887,6 +886,26 @@ void ComputeProjection(const XrFovf& eye, float aspect, EyeView& out, XrFovf& re
     rendered.angleUp = atanf(cy + halfH);
 }
 
+// Size of the eyes' images handed to the runtime: the headset's recommended pixel density over the
+// frustum rendered for a w x h image. Streaming runtimes scale every image to their stream size
+// without averaging, so extra pixels would be skipped (no anti-aliasing from them); the bridge
+// averages them itself instead. Smaller images stay as they are, except with quad views (the eye's
+// image is scaled up there, for the focus view laid over it).
+void EyeImageSize(UINT w, UINT h, bool scaleUp, UINT& outW, UINT& outH)
+{
+    outW = w, outH = h;
+    if (!S.recW || S.pairViewFrame == ~0ull) return;
+    const XrFovf& eye = S.pairViews[0].fov;
+    EyeView unused;
+    XrFovf rendered;
+    ComputeProjection(eye, (float)w / (float)h, unused, rendered);
+    float tw = (tanf(rendered.angleRight) - tanf(rendered.angleLeft)) / (tanf(eye.angleRight) - tanf(eye.angleLeft));
+    UINT rw = ((UINT)((float)S.recW * tw) + 7) & ~7u;
+    if (rw >= w && !scaleUp) return;
+    outW = rw;
+    outH = ((UINT)((float)rw * (float)h / (float)w) + 7) & ~7u;
+}
+
 // Debug: writes the backbuffer (half resolution) to x64\fs25vr_dump_<frame>_eye<n>.bmp. Stalls the GPU.
 void DumpBackbuffer(ID3D12Resource* bb, int eye)
 {
@@ -1054,10 +1073,10 @@ void CopyFrame(IDXGISwapChain* swap)
     S.bbW = (UINT)desc.Width;
     S.bbH = desc.Height;
 
-    // with quad views the eyes' images are scaled up to the focus views' density
-    const bool quad = S.planeStereo && S.ovCount == 3 && S.quadW;
-    if ((S.shouldRender || g_config.forceRender || S.async) &&
-        EnsureSwapchains(quad ? S.quadW : S.bbW, quad ? S.quadH : S.bbH, S.bbW, S.bbH)) {
+    const bool quad = S.planeStereo && S.ovCount == 3;
+    UINT eyeW, eyeH;
+    EyeImageSize(S.bbW, S.bbH, quad, eyeW, eyeH);
+    if ((S.shouldRender || g_config.forceRender || S.async) && EnsureSwapchains(eyeW, eyeH, S.bbW, S.bbH)) {
         // the game draws the OS cursor, which is not part of the backbuffer; draw one into the copy
         CursorDraw cursor;
         if (g_config.showCursor && CursorInBackbuffer(S.bbW, S.bbH, cursor.x, cursor.y)) {
@@ -1683,7 +1702,6 @@ int PrepareOverlay(bool on, bool quad, uint32_t w[3], uint32_t h[3])
     }
     overlay::LockImage(false);
     S.ovCount = 0;
-    S.quadW = S.quadH = 0;
     if (on && S.bbW && S.bbH) {
         // sizes no game render target has, all different (the bridge tells the overlays apart by size)
         S.ovCount = 1;
@@ -1699,9 +1717,6 @@ int PrepareOverlay(bool on, bool quad, uint32_t w[3], uint32_t h[3])
                 S.ovW[1 + e] = (((UINT)(density * (tanf(f.angleRight) - tanf(f.angleLeft))) + 7) & ~7u) + 8 * e;
                 S.ovH[1 + e] = ((UINT)(density * (tanf(f.angleUp) - tanf(f.angleDown))) + 7) & ~7u;
             }
-            // the eyes' images at the focus views' density (as the quad views layer composites them)
-            S.quadW = ((UINT)(g_config.quadFocusDensity * (float)S.recW) + 7) & ~7u;
-            S.quadH = ((UINT)((float)S.quadW * (float)S.bbH / (float)S.bbW) + 7) & ~7u;
             S.ovCount = 3;
         }
     }
@@ -1713,8 +1728,8 @@ int PrepareOverlay(bool on, bool quad, uint32_t w[3], uint32_t h[3])
     overlay::SetSizes(S.ovCount, S.ovW, S.ovH);
     if (S.ovCount == 3)
         Log("stereo overlays prepared: right eye %ux%u, focus views %ux%u / %ux%u (%.2f x %.2f of the field of view, "
-            "%.2fx density), eye images %ux%u", S.ovW[0], S.ovH[0], S.ovW[1], S.ovH[1], S.ovW[2], S.ovH[2],
-            g_config.quadFocusWidth, g_config.quadFocusHeight, g_config.quadFocusDensity, S.quadW, S.quadH);
+            "%.2fx density)", S.ovW[0], S.ovH[0], S.ovW[1], S.ovH[1], S.ovW[2], S.ovH[2], g_config.quadFocusWidth,
+            g_config.quadFocusHeight, g_config.quadFocusDensity);
     else
         Log("stereo overlay %s (%ux%u)", S.ovCount ? "prepared" : "off", w[0], h[0]);
     return S.ovCount;

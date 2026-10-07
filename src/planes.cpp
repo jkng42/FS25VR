@@ -21,7 +21,7 @@ enum Slot {
     kNeedsPresent = 9,  // 0x48 (i)
     kOutputSlot = 10,   // 0x50 (i) -> int
     kFrustum = 11,      // 0x58 (i, bool* ortho, float* l, float* r, float* b, float* t), in/out tangents
-    kViewport = 12,     // 0x60 (i, int* x, int* y)
+    kViewport = 12,     // 0x60 (i, int* x, int* y, int* w, int* h), w/h in: the renderer's resolution
     kAspect = 13,       // 0x68 (i, flag) -> float
     kOffset = 16,       // 0x80 (i, float out[3]) camera-space offset of the plane's view
     kWidth = 18,        // 0x90 (i)
@@ -125,10 +125,13 @@ void Frustum(Composite* c, uint32_t i, bool* ortho, float* l, float* r, float* b
     }
 }
 
-void Viewport(Composite* c, uint32_t i, int* x, int* y)
+// The engine renders every plane at its one render resolution (the game window's), passed in w/h;
+// a plane's output is that image scaled to the plane's size. (Other sizes per plane break the
+// engine's scaling.)
+void Viewport(Composite* c, uint32_t i, int* x, int* y, int* w, int* h)
 {
     void* p = PlaneFor(c, i);
-    Method<void (*)(void*, uint32_t, int*, int*)>(p, kViewport)(p, LocalIndex(c, i), x, y);
+    Method<void (*)(void*, uint32_t, int*, int*, int*, int*)>(p, kViewport)(p, LocalIndex(c, i), x, y, w, h);
 }
 
 float Aspect(Composite* c, uint32_t i, uint8_t flag)

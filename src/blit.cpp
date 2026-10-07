@@ -48,7 +48,15 @@ float4 ps(V i) : SV_Target
 {
     float2 uv = (i.pos.xy - rect.xy) / rect.zw;
     float2 sp = uv / scale;
-    float4 c = src.SampleLevel(smp, uv, 0);
+    // a smaller target: the average of all source texels in the target pixel (up to 4x4), not one
+    // bilinear sample (which skips texels and keeps their aliasing)
+    int2 n = clamp((int2)ceil(1 / (scale * rect.zw) - 0.01), 1, 4);
+    float2 step = 1 / (rect.zw * n);
+    float2 first = uv - 0.5 / rect.zw + 0.5 * step;
+    float4 c = 0;
+    for (int y = 0; y < n.y; y++)
+        for (int x = 0; x < n.x; x++) c += src.SampleLevel(smp, first + float2(x, y) * step, 0);
+    c /= n.x * n.y;
     c.rgb = saturate(c.rgb);
     // the focus view laid over the eye's image: fades out towards its edges
     float a = 1;
