@@ -43,47 +43,56 @@ bool          g_installed = false;
 struct Composite {
     void** vtbl;
     void*  inner;  // the window plane (plane 0)
-    int    eye;    // -1: both planes; 0/1: only that plane (as plane 0)
+    int    eye;    // -1: all planes; 0..3: only that plane (as plane 0)
 };
 void*     g_vtbl[kSlots] = {};
 Composite g_composite{nullptr, nullptr, -1};
-Composite g_eyeOnly[2] = {{nullptr, nullptr, 0}, {nullptr, nullptr, 1}};  // per-eye scene views
+Composite g_eyeOnly[kMaxPlanes] = {{nullptr, nullptr, 0}, {nullptr, nullptr, 1}, {nullptr, nullptr, 2},
+                                   {nullptr, nullptr, 3}};  // per-plane light views
 
 std::mutex g_mtx;
 std::atomic<bool> g_on{false};
-void*  g_texPlane = nullptr;   // the render overlay's DisplayTexture plane (plane 1)
-float  g_offset[3] = {};
-float  g_tans[4] = {};
-bool   g_haveEye = false;
-bool   g_twoThisFrame = false;  // decided once per frame, when the engine fetches the provider
+void*  g_texPlane[kMaxPlanes - 1] = {};  // the render overlays' DisplayTexture planes (planes 1..)
+int    g_texCount = 0;
+float  g_offset[kMaxPlanes][3] = {};
+float  g_tans[kMaxPlanes][4] = {};
+bool   g_haveView[kMaxPlanes] = {};
+int    g_planesThisFrame = 1;  // decided once per frame, when the engine fetches the provider
 
 // shared with the sun shadow thunks (see InstallSunShadows)
 struct SunShadowData {
-    void*   eye[2];  // +0x00 the eye light views' contexts (this frame)
-    uint8_t on;      // +0x10 two planes this frame
+    void*   eye[kMaxPlanes];  // +0x00 the planes' light views' contexts (this frame)
+    uint8_t on;               // +0x20 several planes this frame
     uint8_t pad[7];
-    void*   scene;   // +0x18 the scene view's light context (this frame)
+    void*   scene;            // +0x28 the scene view's light context (this frame)
 };
 SunShadowData* g_sun = nullptr;
 
 
 template <typename T> T Method(void* obj, int slot) { return (T)(*(void***)obj)[slot]; }
 
-// plane 1 is the right eye (the overlay's texture), plane 0 the window (left eye)
+// plane 0 is the window (left eye), planes 1.. the overlays' textures (right eye, focus views)
 uint32_t Global(Composite* c, uint32_t i) { return c->eye >= 0 ? (uint32_t)c->eye : i; }
 void* PlaneFor(Composite* c, uint32_t i)
 {
-    if (!g_twoThisFrame) return c->inner;
-    return Global(c, i) == 1 ? g_texPlane : c->inner;
+    if (g_planesThisFrame < 2) return c->inner;
+    uint32_t g = Global(c, i);
+    return g >= 1 && g < (uint32_t)g_planesThisFrame ? g_texPlane[g - 1] : c->inner;
 }
-uint32_t LocalIndex(Composite* c, uint32_t i) { return g_twoThisFrame ? 0 : i; }
-bool IsRight(Composite* c, uint32_t i) { return g_twoThisFrame && Global(c, i) == 1; }
+uint32_t LocalIndex(Composite* c, uint32_t i) { return g_planesThisFrame > 1 ? 0 : i; }
+// an overlay plane: its view is placed by the bridge (the window's by the Lua camera)
+int Placed(Composite* c, uint32_t i)
+{
+    if (g_planesThisFrame < 2) return -1;
+    uint32_t g = Global(c, i);
+    return g >= 1 && g < (uint32_t)g_planesThisFrame ? (int)g : -1;
+}
 
 // --- routed methods --------------------------------------------------------------------------
 
 uint32_t Count(Composite* c)
 {
-    if (g_twoThisFrame) return c->eye >= 0 ? 1 : 2;
+    if (g_planesThisFrame > 1) return c->eye >= 0 ? 1 : (uint32_t)g_planesThisFrame;
     return Method<uint32_t (*)(void*)>(c->inner, kCount)(c->inner);
 }
 
@@ -104,13 +113,14 @@ void Frustum(Composite* c, uint32_t i, bool* ortho, float* l, float* r, float* b
     void* p = PlaneFor(c, i);
     Method<void (*)(void*, uint32_t, bool*, float*, float*, float*, float*)>(p, kFrustum)(p, LocalIndex(c, i), ortho, l,
                                                                                           r, b, t);
-    if (IsRight(c, i)) {
+    int k = Placed(c, i);
+    if (k >= 0) {
         std::lock_guard<std::mutex> lock(g_mtx);
-        if (g_haveEye) {
-            *l = g_tans[0];
-            *r = g_tans[1];
-            *b = g_tans[2];
-            *t = g_tans[3];
+        if (g_haveView[k]) {
+            *l = g_tans[k][0];
+            *r = g_tans[k][1];
+            *b = g_tans[k][2];
+            *t = g_tans[k][3];
         }
     }
 }
@@ -131,12 +141,13 @@ void Offset(Composite* c, uint32_t i, float* out)
 {
     void* p = PlaneFor(c, i);
     Method<void (*)(void*, uint32_t, float*)>(p, kOffset)(p, LocalIndex(c, i), out);
-    if (IsRight(c, i)) {
+    int k = Placed(c, i);
+    if (k >= 0) {
         std::lock_guard<std::mutex> lock(g_mtx);
-        if (g_haveEye) {
-            out[0] += g_offset[0];
-            out[1] += g_offset[1];
-            out[2] += g_offset[2];
+        if (g_haveView[k]) {
+            out[0] += g_offset[k][0];
+            out[1] += g_offset[k][1];
+            out[2] += g_offset[k][2];
         }
     }
 }
@@ -197,7 +208,7 @@ bool BuildVtable()
     g_vtbl[kOutputSlot] = (void*)OutputSlot;
     g_vtbl[kPresent] = (void*)Present;
     g_composite.vtbl = g_vtbl;
-    g_eyeOnly[0].vtbl = g_eyeOnly[1].vtbl = g_vtbl;
+    for (Composite& c : g_eyeOnly) c.vtbl = g_vtbl;
     return true;
 }
 
@@ -220,21 +231,22 @@ void* Hook_GetPlanes(char* mgr, void* window, float aspect)
         cached = g_ctor(g_alloc(0x40), key, aspect);
     }
     // Render overlays queued this frame (shop previews, ...) render their view with the same job
-    // identifier as a second plane (plane index << 24): one plane in such frames.
+    // identifier as a further plane (plane index << 24): one plane in such frames.
     bool queued = false;
     if (g_on) {
         char* renderer = *(char**)(g_engine() + 0x110);
         queued = renderer && *(void***)(renderer + 0x508) != *(void***)(renderer + 0x500);
     }
-    bool two = g_on && g_texPlane && !queued;
-    g_twoThisFrame = two;
-    if (g_sun) g_sun->on = two;
-    if (!g_on || !g_texPlane) return cached;
-    g_composite.inner = g_eyeOnly[0].inner = g_eyeOnly[1].inner = cached;
+    bool multi = g_on && g_texCount && !queued;
+    g_planesThisFrame = multi ? 1 + g_texCount : 1;
+    if (g_sun) g_sun->on = multi;
+    if (!g_on || !g_texCount) return cached;
+    g_composite.inner = cached;
+    for (Composite& c : g_eyeOnly) c.inner = cached;
     return &g_composite;
 }
 
-// --- sun shadows for the eye light views -----------------------------------------------------
+// --- sun shadows for the planes' light views -------------------------------------------------
 // The sun's shadow cascades are one set for the scene, fitted by the cascade generator to the frustum
 // of each view that has flag 0x10; a second such view refits the same cascades to its own frustum
 // (the other eye then misses shadows at its outer edge). So the eye light views (see
@@ -346,8 +358,8 @@ bool InstallSunShadows()
     }
     g_sun = (SunShadowData*)mem;
     BYTE* passThunk = mem + 0x40;
-    BYTE* setupThunk = mem + 0x180;
-    BYTE* createThunk = mem + 0x1C0;
+    BYTE* setupThunk = mem + 0x200;
+    BYTE* createThunk = mem + 0x280;
     BYTE* passTarget = pass + 5 + *(int32_t*)(pass + 1);
     BYTE* setupTarget = setup + 5 + *(int32_t*)(setup + 1);
     BYTE* createTarget = create1 + 5 + *(int32_t*)(create1 + 1);
@@ -358,15 +370,18 @@ bool InstallSunShadows()
     // wrong cascades (only near, drifting, or none at all).
     Emit e{passThunk};
     e.b({0x49, 0xBA}); e.q((uint64_t)g_sun);          // mov r10, g_sun
-    e.b({0x41, 0x80, 0x7A, 0x10, 0x00});              // cmp byte [r10+10h], 0 (other modes' contexts
+    e.b({0x41, 0x80, 0x7A, 0x20, 0x00});              // cmp byte [r10+20h], 0 (other modes' contexts
     BYTE* done1 = e.jcc(0x74);                        // je done                own their cascades)
     e.b({0x4C, 0x8B, 0x19});                          // mov r11, [rcx] (the context)
-    e.b({0x4D, 0x3B, 0x1A});                          // cmp r11, [r10]
-    BYTE* eye = e.jcc(0x74);                          // je eye
-    e.b({0x4D, 0x3B, 0x5A, 0x08});                    // cmp r11, [r10+8]
+    BYTE* eye[kMaxPlanes - 1];
+    for (int i = 0; i < kMaxPlanes - 1; i++) {
+        e.b({0x4D, 0x3B, 0x5A, i * 8});               // cmp r11, [r10+i*8]
+        eye[i] = e.jcc(0x74);                         // je eye
+    }
+    e.b({0x4D, 0x3B, 0x5A, (kMaxPlanes - 1) * 8});    // cmp r11, [r10+(last)*8]
     BYTE* done2 = e.jcc(0x75);                        // jne done
-    e.land(eye);
-    e.b({0x49, 0x8B, 0x42, 0x18});                    // mov rax, [r10+18h] (the scene's context)
+    for (BYTE* d : eye) e.land(d);
+    e.b({0x49, 0x8B, 0x42, 0x28});                    // mov rax, [r10+28h] (the scene's context)
     e.b({0x48, 0x85, 0xC0});                          // test rax, rax
     BYTE* done3 = e.jcc(0x74);                        // je done
     e.b({0x48, 0x8B, 0x40, 0x10});                    // mov rax, [rax+10h] (its first record)
@@ -384,20 +399,23 @@ bool InstallSunShadows()
     for (BYTE* d : {done1, done2, done3, done4, done5, done6}) e.land(d);
     e.jmpAbs(passTarget);
 
-    // setup and cascade creation: is the context (rcx / rdi) an eye light view's?
-    auto isEye = [&](int cmpLo, int cmpHi) {
+    // setup and cascade creation: is the context (rcx / rdi) a plane light view's?
+    auto isEye = [&](int modrm) {
         e.b({0x49, 0xBA}); e.q((uint64_t)g_sun);      // mov r10, g_sun
-        e.b({0x41, 0x80, 0x7A, 0x10, 0x00});          // cmp byte [r10+10h], 0
+        e.b({0x41, 0x80, 0x7A, 0x20, 0x00});          // cmp byte [r10+20h], 0
         BYTE* no1 = e.jcc(0x74);                      // je no
-        e.b({0x49, 0x3B, cmpLo});                     // cmp reg, [r10]
-        BYTE* yes = e.jcc(0x74);                      // je yes
-        e.b({0x49, 0x3B, cmpHi, 0x08});               // cmp reg, [r10+8]
+        BYTE* yes[kMaxPlanes - 1];
+        for (int i = 0; i < kMaxPlanes - 1; i++) {
+            e.b({0x49, 0x3B, modrm, i * 8});          // cmp reg, [r10+i*8]
+            yes[i] = e.jcc(0x74);                     // je yes
+        }
+        e.b({0x49, 0x3B, modrm, (kMaxPlanes - 1) * 8});
         BYTE* no2 = e.jcc(0x75);                      // jne no
-        e.land(yes);
+        for (BYTE* d : yes) e.land(d);
         return std::make_pair(no1, no2);
     };
     e.p = setupThunk;
-    auto [s1, s2] = isEye(0x0A, 0x4A);                // rcx
+    auto [s1, s2] = isEye(0x4A);                      // rcx
     e.b({0xB2, 0x01});                                // mov dl, 1
     e.b({0xC6, 0x41, 0x30, 0x01});                    // mov byte [rcx+30h], 1
     e.land(s1);
@@ -405,7 +423,7 @@ bool InstallSunShadows()
     e.jmpAbs(setupTarget);
 
     e.p = createThunk;
-    auto [c1, c2] = isEye(0x3A, 0x7A);                // rdi
+    auto [c1, c2] = isEye(0x7A);                      // rdi
     e.b({0xC3});                                      // ret (skipped; the result is not used)
     e.land(c1);
     e.land(c2);
@@ -451,25 +469,31 @@ constexpr uint32_t kLightViewFlags = 0x1;
 PFN_AllocView g_allocView = nullptr;
 PFN_SetupView g_setupView = nullptr;
 PFN_SubView   g_subView = nullptr;
-char*         g_eyeView[2] = {};  // the light views of the frame being set up
+char*         g_eyeView[kMaxPlanes] = {};  // the light views of the frame being set up
+int           g_eyeViews = 0;
 
 char* Hook_AllocView(void* pool, uint64_t a2, uint32_t flags, uint32_t a4, uint64_t a5, uint64_t a6, uint64_t a7)
 {
     char* view = g_allocView(pool, a2, flags, a4, a5, a6, a7);
-    for (char*& eye : g_eyeView)
-        eye = g_twoThisFrame ? g_allocView(pool, a2, kLightViewFlags, a4, a5, a6, a7) : nullptr;
+    g_eyeViews = g_planesThisFrame > 1 ? g_planesThisFrame : 0;
+    for (int i = 0; i < kMaxPlanes; i++)
+        g_eyeView[i] = i < g_eyeViews ? g_allocView(pool, a2, kLightViewFlags, a4, a5, a6, a7) : nullptr;
+    for (int i = 0; i < g_eyeViews; i++)
+        if (!g_eyeView[i]) g_eyeViews = 0;
     return view;
 }
 
 void Hook_SetupView(char* view, void* camera, void* provider, float a4)
 {
     g_setupView(view, camera, provider, a4);
-    if (!g_eyeView[0] || !g_eyeView[1] || provider != &g_composite) return;
-    for (int i = 0; i < 2; i++) {
+    if (!g_eyeViews || provider != &g_composite) return;
+    for (int i = 0; i < kMaxPlanes; i++) {
         char* eye = g_eyeView[i];
-        g_setupView(eye, camera, &g_eyeOnly[i], a4);
-        *(char**)(eye + 0x440) = eye + 0x220;  // as the engine does for the scene view
-        if (g_sun) g_sun->eye[i] = *(void**)(eye + 0x470);
+        if (eye) {
+            g_setupView(eye, camera, &g_eyeOnly[i], a4);
+            *(char**)(eye + 0x440) = eye + 0x220;  // as the engine does for the scene view
+        }
+        if (g_sun) g_sun->eye[i] = eye ? *(void**)(eye + 0x470) : nullptr;
     }
     if (g_sun) g_sun->scene = *(void**)(view + 0x470);
 }
@@ -479,7 +503,7 @@ char* Hook_SubView(void* pool, void* renderer, uint32_t job, uint32_t a4, uint64
 {
     char* sub = g_subView(pool, renderer, job, a4, a5, a6, a7, view);
     uint32_t plane = job >> 24;  // the main render numbers its planes: job id = plane index << 24
-    if (!sub || !g_eyeView[0] || !g_eyeView[1] || plane > 1 || (job & 0xFFFFFF)) return sub;
+    if (!sub || !g_eyeViews || plane >= (uint32_t)g_eyeViews || (job & 0xFFFFFF)) return sub;
     char* eye = g_eyeView[plane];
     memcpy(eye + 0x408, view + 0x408, 8);  // output size, set per plane on the scene view
     *(void**)(sub + 0x630) = *(void**)(eye + 0x968);  // the subview's light object
@@ -534,7 +558,7 @@ bool InstallLightViews()
         return false;
     }
     BYTE* base = (BYTE*)GetModuleHandleW(nullptr);
-    Log("planes: light view per eye: view +%llx, setup +%llx, subview +%llx", (unsigned long long)(allocCall - base),
+    Log("planes: light view per plane: view +%llx, setup +%llx, subview +%llx", (unsigned long long)(allocCall - base),
         (unsigned long long)(setupCall - base), (unsigned long long)(subCall - base));
     return true;
 }
@@ -572,7 +596,7 @@ bool Install()
     return true;
 }
 
-bool SetStereo(bool on)
+bool SetStereo(bool on, int overlays)
 {
     if (!g_installed) return false;
     if (!on) {
@@ -580,37 +604,45 @@ bool SetStereo(bool on)
         Log("planes: stereo off");
         return true;
     }
-    // the overlay the Lua mod just queued: last entry of the renderer's overlay queue
+    if (overlays < 1 || overlays > kMaxPlanes - 1) return false;
+    // the overlays the Lua mod just queued, in order: the last entries of the renderer's overlay queue
     char* renderer = *(char**)(g_engine() + 0x110);
     void** begin = renderer ? *(void***)(renderer + 0x500) : nullptr;
     void** end = renderer ? *(void***)(renderer + 0x508) : nullptr;
-    if (!renderer || end <= begin) {
-        Log("planes: no queued render overlay");
+    if (!renderer || end - begin < overlays) {
+        Log("planes: %d render overlays not queued", overlays);
         return false;
     }
-    char* overlay = (char*)end[-1];
-    void* tex = overlay + 0x88;  // the overlay's DisplayTexture plane
-    // take it out of the queue again: rendered by itself it would use the second plane's job id
-    *(void***)(renderer + 0x508) = end - 1;
-    overlay[0x13C] = 0;
+    void* tex[kMaxPlanes - 1] = {};
+    for (int i = 0; i < overlays; i++) {
+        char* overlay = (char*)end[i - overlays];
+        tex[i] = overlay + 0x88;  // the overlay's DisplayTexture plane
+        overlay[0x13C] = 0;
+        Log("planes: plane %d: overlay %p, texture plane %p (%ux%u)", i + 1, overlay, tex[i],
+            *(uint32_t*)((char*)tex[i] + 8), *(uint32_t*)((char*)tex[i] + 0xC));
+    }
+    // take them out of the queue again: rendered by themselves they would use further planes' job ids
+    *(void***)(renderer + 0x508) = end - overlays;
     {
         std::lock_guard<std::mutex> lock(g_mtx);
-        g_texPlane = tex;
+        memcpy(g_texPlane, tex, sizeof(tex));
+        g_texCount = overlays;
+        for (bool& h : g_haveView) h = false;
     }
     g_on = true;
-    Log("planes: stereo on, overlay %p, texture plane %p (%ux%u)", overlay, tex, *(uint32_t*)((char*)tex + 8),
-        *(uint32_t*)((char*)tex + 0xC));
+    Log("planes: stereo on, %d planes", overlays + 1);
     return true;
 }
 
-bool Active() { return g_on && g_texPlane; }
+bool Active() { return g_on && g_texCount; }
 
-void SetOtherEye(const float offset[3], const float tans[4])
+void SetPlaneView(int plane, const float offset[3], const float tans[4])
 {
+    if (plane < 1 || plane >= kMaxPlanes) return;
     std::lock_guard<std::mutex> lock(g_mtx);
-    memcpy(g_offset, offset, sizeof(g_offset));
-    memcpy(g_tans, tans, sizeof(g_tans));
-    g_haveEye = true;
+    memcpy(g_offset[plane], offset, sizeof(g_offset[plane]));
+    memcpy(g_tans[plane], tans, sizeof(g_tans[plane]));
+    g_haveView[plane] = true;
 }
 
 } // namespace planes

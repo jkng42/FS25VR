@@ -89,15 +89,18 @@ int L_getView(lua_State* L)
     return 14;
 }
 
-// vr.prepareOverlay(on) -> width, height: the size to create the render overlay for plane stereo
-// with (0 = off); the bridge watches for the render targets of that size
+// vr.prepareOverlay(on, quad) -> width, height, ...: the sizes to create the render overlays for plane
+// stereo with (one pair per overlay: the right eye; with quad views also the left and right focus
+// views; 0, 0 = off); the bridge watches for the render targets of those sizes
 int L_prepareOverlay(lua_State* L)
 {
-    uint32_t w = 0, h = 0;
-    vr::PrepareOverlay(ArgBool(L, 1), w, h);
-    PushNumber(L, w);
-    PushNumber(L, h);
-    return 2;
+    uint32_t w[3] = {}, h[3] = {};
+    int n = vr::PrepareOverlay(ArgBool(L, 1), ArgBool(L, 2), w, h);
+    for (int i = 0; i < (n ? n : 1); i++) {
+        PushNumber(L, w[i]);
+        PushNumber(L, h[i]);
+    }
+    return 2 * (n ? n : 1);
 }
 
 // vr.setPlaneStereo(on) -> ok: the render overlay just queued with updateRenderOverlay becomes the

@@ -26,15 +26,22 @@ struct Info {
     D3D12_RESOURCE_DESC   desc{};
     DXGI_FORMAT           viewFormat = DXGI_FORMAT_UNKNOWN;
     D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;
+    int                   slot = 0;
+};
+
+// one per render overlay, told apart by size
+struct Slot {
+    UINT            w = 0, h = 0;
+    ID3D12Resource* frameImage = nullptr;  // last made readable in the frame being recorded
+    ID3D12Resource* image = nullptr;       // ... in the frame being presented
+    Info            imageInfo;
+    ID3D12Resource* locked = nullptr;      // fixed output (plane stereo)
 };
 
 std::mutex g_mtx;
-std::unordered_map<ID3D12Resource*, Info> g_targets;  // render targets at the overlay's size
-UINT            g_w = 0, g_h = 0;
-ID3D12Resource* g_frameImage = nullptr;  // last made readable in the frame being recorded
-ID3D12Resource* g_image = nullptr;       // ... in the frame being presented
-Info            g_imageInfo;
-ID3D12Resource* g_locked = nullptr;      // fixed output (plane stereo)
+std::unordered_map<ID3D12Resource*, Info> g_targets;  // render targets at an overlay's size
+Slot            g_slots[kMaxSlots];
+int             g_slotCount = 0;
 bool            g_installed = false;
 
 bool Patch(void** slot, void* value, void** original)
@@ -66,16 +73,19 @@ void STDMETHODCALLTYPE Hook_CreateRTV(ID3D12Device* self, ID3D12Resource* res, c
     o_CreateRTV(self, res, d, h);
     if (!res) return;
     std::lock_guard<std::mutex> lock(g_mtx);
-    if (!g_w || g_targets.count(res)) return;
+    if (!g_slotCount || g_targets.count(res)) return;
     D3D12_RESOURCE_DESC rd = res->GetDesc();
-    if (rd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || rd.Width != g_w || rd.Height != g_h ||
-        rd.SampleDesc.Count != 1)
-        return;
+    if (rd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || rd.SampleDesc.Count != 1) return;
+    int slot = 0;
+    while (slot < g_slotCount && !(rd.Width == g_slots[slot].w && rd.Height == g_slots[slot].h)) slot++;
+    if (slot == g_slotCount) return;
     Info info;
     info.desc = rd;
+    info.slot = slot;
     info.viewFormat = d && d->Format != DXGI_FORMAT_UNKNOWN ? d->Format : rd.Format;
     g_targets[res] = info;
-    Log("overlay: render target %p %llux%u fmt %d (view %d)", res, rd.Width, rd.Height, rd.Format, info.viewFormat);
+    Log("overlay %d: render target %p %llux%u fmt %d (view %d)", slot, res, rd.Width, rd.Height, rd.Format,
+        info.viewFormat);
 }
 
 void STDMETHODCALLTYPE Hook_Barrier(ID3D12GraphicsCommandList* self, UINT n, const D3D12_RESOURCE_BARRIER* b)
@@ -89,7 +99,8 @@ void STDMETHODCALLTYPE Hook_Barrier(ID3D12GraphicsCommandList* self, UINT n, con
         if (it == g_targets.end()) continue;
         it->second.state = b[i].Transition.StateAfter;
         // the final image is 8-bit (tonemapped); HDR targets of the overlay come before it
-        if ((b[i].Transition.StateAfter & kReadable) && Is8Bit(it->second.viewFormat)) g_frameImage = it->first;
+        if ((b[i].Transition.StateAfter & kReadable) && Is8Bit(it->second.viewFormat))
+            g_slots[it->second.slot].frameImage = it->first;
     }
 }
 
@@ -115,47 +126,60 @@ void Install(ID3D12Device* device)
         o_Barrier != nullptr);
 }
 
-void SetSize(UINT w, UINT h)
+void SetSizes(int count, const UINT* w, const UINT* h)
 {
     std::lock_guard<std::mutex> lock(g_mtx);
-    if (w == g_w && h == g_h) return;
-    g_w = w;
-    g_h = h;
+    count = count < 0 ? 0 : count > kMaxSlots ? kMaxSlots : count;
+    bool same = count == g_slotCount;
+    for (int i = 0; same && i < count; i++) same = w[i] == g_slots[i].w && h[i] == g_slots[i].h;
+    if (same) return;
     g_targets.clear();  // a new overlay creates new targets
-    g_locked = nullptr;
-    g_frameImage = nullptr;
-    if (g_image) g_image->Release();
-    g_image = nullptr;
-    Log("overlay: size %ux%u", w, h);
+    for (Slot& s : g_slots) {
+        if (s.image) s.image->Release();
+        s = Slot{};
+    }
+    g_slotCount = count;
+    for (int i = 0; i < count; i++) {
+        g_slots[i].w = w[i];
+        g_slots[i].h = h[i];
+        Log("overlay %d: size %ux%u", i, w[i], h[i]);
+    }
+    if (!count) Log("overlay: none");
 }
 
 void LockImage(bool on)
 {
     std::lock_guard<std::mutex> lock(g_mtx);
-    g_locked = on ? g_image : nullptr;
-    Log("overlay: image %s (%p)", g_locked ? "locked" : "picked per frame", g_locked);
+    for (int i = 0; i < g_slotCount; i++) {
+        Slot& s = g_slots[i];
+        s.locked = on ? s.image : nullptr;
+        Log("overlay %d: image %s (%p)", i, s.locked ? "locked" : "picked per frame", s.locked);
+    }
 }
 
 void OnFrameEnd()
 {
     std::lock_guard<std::mutex> lock(g_mtx);
-    if (g_locked && g_targets.count(g_locked)) g_frameImage = g_locked;
-    if (g_image) g_image->Release();
-    g_image = g_frameImage;
-    g_frameImage = nullptr;
-    if (g_image) {
-        g_image->AddRef();
-        g_imageInfo = g_targets[g_image];
+    for (int i = 0; i < g_slotCount; i++) {
+        Slot& s = g_slots[i];
+        if (s.locked && g_targets.count(s.locked)) s.frameImage = s.locked;
+        if (s.image) s.image->Release();
+        s.image = s.frameImage;
+        s.frameImage = nullptr;
+        if (s.image) {
+            s.image->AddRef();
+            s.imageInfo = g_targets[s.image];
+        }
     }
 }
 
-ID3D12Resource* Image(DXGI_FORMAT& format, D3D12_RESOURCE_STATES& state)
+ID3D12Resource* Image(int slot, DXGI_FORMAT& format, D3D12_RESOURCE_STATES& state)
 {
     std::lock_guard<std::mutex> lock(g_mtx);
-    if (!g_image) return nullptr;
-    format = g_imageInfo.viewFormat;
-    state = g_imageInfo.state;
-    return g_image;
+    if (slot < 0 || slot >= g_slotCount || !g_slots[slot].image) return nullptr;
+    format = g_slots[slot].imageInfo.viewFormat;
+    state = g_slots[slot].imageInfo.state;
+    return g_slots[slot].image;
 }
 
 } // namespace overlay
