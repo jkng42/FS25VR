@@ -16,12 +16,16 @@ struct BlitRect {
     float smoothing = 0;
 };
 
-// A flat panel placed in head space in front of the eye, drawn over the eye's image.
+// A flat panel in space drawn over an eye's image: a part of the source texture on a rectangle given
+// in the eye's space (metres, -z forward, +y up).
 struct PanelDraw {
     float tanLeft = -1, tanRight = 1, tanUp = 1, tanDown = -1;  // the eye image's frustum
-    float eye[3] = {};                // the eye's position in head space (metres, -z forward)
-    float x = 0, y = 0, w = 1, h = 1; // panel centre and size on the plane z = -distance
-    float distance = 1;
+    float centre[3] = {0, 0, -1};     // the rectangle's centre
+    float axisU[3] = {0.5f, 0, 0};    // from the centre to its right edge
+    float axisV[3] = {0, 0.5f, 0};    // from the centre to its top edge
+    float uv[4] = {0, 0, 1, 1};       // the part of the source it shows (u0, v0, u1, v1; v down)
+    float mark[4] = {};               // outline colour (rgb) and strength; 0 = none
+    float border[4] = {};             // outline width as a share of the half width / height, fill strength, plain area (1)
 };
 
 // Draws a game backbuffer into an OpenXR swapchain image with a fullscreen triangle.
@@ -53,7 +57,10 @@ private:
     ID3D12PipelineState*  m_psoPanel = nullptr;
     ID3D12DescriptorHeap* m_srvHeap = nullptr;
     UINT                  m_srvInc = 0;
+    static constexpr UINT kSrvRing = 512;
     UINT                  m_srvNext = 0;
+    ID3D12Resource*       m_srvLastRes = nullptr;   // the source of the newest view (reused for the same)
+    DXGI_FORMAT           m_srvLastFormat = DXGI_FORMAT_UNKNOWN;
     bool                  m_decodeSrgb = false;
 };
 

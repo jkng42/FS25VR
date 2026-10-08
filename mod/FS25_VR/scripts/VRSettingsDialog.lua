@@ -39,6 +39,7 @@ function VRSettingsDialog:onOpen()
     VRSettingsDialog:superClass().onOpen(self)
     local mod = self.mod
     self.guiTitle:setText(text("vr_settings_title"))
+    self.hudButton:setText(text("vr_settings_arrangeHud"))
     self.stereoModeTitle:setText(text("vr_settings_stereoMode"))
     self.stereoModeSetting:setTexts({text("vr_settings_modeAlternating"), text("vr_settings_modePlane"),
         text("vr_settings_modeQuad")})
@@ -90,6 +91,11 @@ function VRSettingsDialog:onClickOk()
     local scale = VRSettingsDialog.SCALES[self.renderScaleSetting:getState()] or 1
     g_gui:closeDialogByName("VRSettingsDialog")
     self.mod:applySettings(mode, scale)
+end
+
+function VRSettingsDialog:onClickArrangeHud()
+    g_gui:closeDialogByName("VRSettingsDialog")
+    self.mod:toggleHudArranging()
 end
 
 function VRSettingsDialog:onClickBack()

@@ -42,4 +42,21 @@ void HeadsetInfo(uint32_t& recW, uint32_t& recH, float& focusW, float& focusH);
 bool NextFrameIsSecondEye();  // main thread, before the frame runs  // the mod should draw the latency marker this frame
 const char* Status();
 
+// HUD panels (plane stereo): parts of the game's HUD texture, each placed in recentred tracking
+// space (so in a cab they stay put relative to the seat). uv = u0, v0, u1, v1 of the texture
+// (v down); pos in metres; yaw/pitch in radians (0 = facing the user, the panel's front towards +z);
+// width in metres, the height follows the part's aspect. Count -1 = the whole HUD as one panel at
+// the configured default place. mark (arranging): 0 none, 1 outlined, 2 looked at, 3 held, 4 selected.
+// flags: 1 = placed in head space instead (moves with the head), 2 = a plain area in the mark's colour
+// instead of the HUD (the arranging crosshair).
+constexpr int kMaxHudPanels = 24;
+constexpr int kHudHeadLocked = 1, kHudSolid = 2;
+void SetHudPanelCount(int n);
+void SetHudPanel(int i, const float uv[4], const float pos[3], float yaw, float pitch, float width, int mark,
+                 int flags);
+// The mouse pointer drawn into the headset image (hidden while arranging the HUD).
+void SetCursorVisible(bool on);
+// The head (between the eyes) in recentred tracking space, metres; false while unknown.
+bool HeadPose(float pos[3], float quat[4]);
+
 } // namespace vr

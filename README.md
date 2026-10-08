@@ -11,7 +11,7 @@ fs25vr turns Farming Simulator 25 into a real VR game through OpenXR. It works w
 - **Synchronised eyes.** The simulation holds still between the left and right image of a pair, so moving vehicles and turning stay solid.
 - **Both eyes every frame (optional).** The engine renders the second eye in the same frame, with full lighting, shadows and mirrors. With **quad views** it also renders a sharper view of the middle of each eye. Chosen in the settings menu (F11).
 - **Comfortable menus.** Menus, the map and the shop appear on a flat screen in front of you, with a visible mouse pointer.
-- **HUD at real depth.** With both eyes every frame, the game's HUD (mods' HUDs included) is a panel in front of you, the same in both eyes. With alternating eyes it is hidden (F10 brings it back). Your desktop window stays usable and can be larger than your monitor.
+- **HUD at real depth.** The game's HUD (mods' HUDs included) is split into panels that stay put in the cab, the same in both eyes, and that you can arrange per vehicle. Your desktop window stays usable and can be larger than your monitor.
 
 ## Requirements
 
@@ -69,7 +69,8 @@ The line below the settings shows what reaches the headset, as a multiple of its
 |---|---|
 | F8 | Recentre (sit or stand in your neutral position first) |
 | F9 | VR camera on/off (flat screen in the headset) |
-| F10 | HUD on/off in VR (panel shown by default with both eyes every frame; hidden by default with alternating eyes) |
+| F10 | HUD on/off in VR (while arranging: the help on/off) |
+| Shift+F10 | Arrange the HUD panels (also in the F11 menu). Look at a panel and hold the left mouse button to move it; wheel: distance, Shift+wheel: size, Ctrl+wheel: tilt, Alt+wheel: turn; right click: back to its default place. Saved per vehicle and on foot |
 | F6 | Projection: centred (default) / exact off-centre |
 | F7 | Ambient occlusion: game setting (default) / force SAO |
 | F11 | VR settings: stereo mode (alternating eyes / both eyes every frame / both eyes + quad views) and 3D resolution. Saved, and applied whenever VR starts |
@@ -94,8 +95,8 @@ The head position offset is remembered separately for each vehicle's cab and for
 | `presentLag` | Starting guess for frame latency; measured automatically at VR start |
 | `quadFocusWidth`, `quadFocusHeight` | Quad views: share of each eye's field of view the focus view covers (default 0.5 x 0.45, centred) |
 | `quadFocusSmoothing` | Quad views: width of the focus view's soft edge (default 0.18, 0 = hard edge) |
-| `hudPanel` | 1 (default): with both eyes every frame, the HUD is a panel in front of you instead of flat in the image |
-| `hudDistance`, `hudWidth`, `hudOffsetY` | Placement of the HUD panel (metres; default 1 m away, 1 m wide, centred) |
+| `hudPanel` | 1 (default): the HUD is shown as panels in the cab instead of flat in the image (where it is hidden, F10 shows it) |
+| `hudDistance`, `hudWidth`, `hudOffsetY` | Where the HUD panels start: the flat HUD on a plane this far in front of the seat, this wide, this far up (metres; default 1 m away, 1 m wide, centred) |
 | `profile`, `debugLog` | Diagnostics: GPU timing, a per-frame CSV, verbose logging |
 
 ## How it works
@@ -109,7 +110,7 @@ Eyes are rendered alternately by default: one game frame per eye. Each image goe
 
 With both eyes every frame, the bridge adds the right eye (and with quad views both focus views) as further views of the engine's own main render path, the way the engine supports several screens. Each view gets the whole pipeline: shadows, lights, mirrors, post-processing with its own history. The bridge lays each focus view over its eye's image with a soft edge and hands the headset one image per eye.
 
-The engine draws the whole HUD into a texture of its own and blends it over the image in its last pass. In this mode the bridge copies that texture out and empties it, then draws the copy into both eyes as a panel, each eye with its own perspective.
+The engine draws the whole HUD into a texture of its own and blends it over the image in its last pass. The bridge copies that texture out and empties it, then draws parts of the copy into the eyes' images as panels, each eye with its own perspective. The Lua mod finds the parts: once a second it records for one frame what the HUD draws where, and who draws it (the HUD's displays, and mods by their environments on the call stack). A mod's block next to a display joins that display's panel.
 
 ## Known limitations
 

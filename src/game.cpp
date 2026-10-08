@@ -57,6 +57,13 @@ void PushBool(lua_State* L, bool b)
     Top(L) = t + 1;
 }
 
+double ArgNumber(lua_State* L, int idx, double def = 0)
+{
+    if (idx > GetTop(L)) return def;
+    const TValue& v = Base(L)[idx - 1];
+    return v.tt == LUA_TNUMBER ? v.value.n : def;
+}
+
 bool ArgBool(lua_State* L, int idx)
 {
     if (idx > GetTop(L)) return false;
@@ -131,11 +138,54 @@ int L_isRunning(lua_State* L)
     return 1;
 }
 
-// vr.hudPanel() -> the game's HUD is shown as a panel in 3D (plane stereo) instead of flat in the eyes
+// vr.hudPanel() -> on, distance, width, offsetY: the game's HUD is shown as panels in 3D (plane
+// stereo) instead of flat in the eyes; the default place of the whole HUD (metres)
 int L_hudPanel(lua_State* L)
 {
     PushBool(L, g_config.hudPanel);
-    return 1;
+    PushNumber(L, g_config.hudDistance);
+    PushNumber(L, g_config.hudWidth);
+    PushNumber(L, g_config.hudOffsetY);
+    return 4;
+}
+
+// vr.setHudPanelCount(n): how many panels setHudPanel describes (-1 = the whole HUD as one)
+int L_setHudPanelCount(lua_State* L)
+{
+    vr::SetHudPanelCount((int)ArgNumber(L, 1, -1));
+    return 0;
+}
+
+// vr.setHudPanel(i, u0, v0, u1, v1, x, y, z, yaw, pitch, width, mark): panel i (0-based) shows that
+// part of the HUD texture (v down) at x, y, z in recentred tracking space (metres), turned by yaw and
+// pitch (radians), width metres wide; mark while arranging: 0 none, 1 outlined, 2 looked at, 3 held,
+// 4 selected; flags: 1 head space, 2 plain area in the mark's colour
+int L_setHudPanel(lua_State* L)
+{
+    float uv[4], pos[3];
+    for (int k = 0; k < 4; k++) uv[k] = (float)ArgNumber(L, 2 + k);
+    for (int k = 0; k < 3; k++) pos[k] = (float)ArgNumber(L, 6 + k);
+    vr::SetHudPanel((int)ArgNumber(L, 1, -1), uv, pos, (float)ArgNumber(L, 9), (float)ArgNumber(L, 10),
+                    (float)ArgNumber(L, 11, 1), (int)ArgNumber(L, 12, 0), (int)ArgNumber(L, 13, 0));
+    return 0;
+}
+
+// vr.setCursorVisible(on): the mouse pointer in the headset image
+int L_setCursorVisible(lua_State* L)
+{
+    vr::SetCursorVisible(ArgBool(L, 1));
+    return 0;
+}
+
+// vr.headPose() -> ok, x, y, z, qx, qy, qz, qw: the head in recentred tracking space (metres)
+int L_headPose(lua_State* L)
+{
+    float p[3] = {}, q[4] = {0, 0, 0, 1};
+    bool ok = vr::HeadPose(p, q);
+    PushBool(L, ok);
+    for (float v : p) PushNumber(L, v);
+    for (float v : q) PushNumber(L, v);
+    return 8;
 }
 
 int L_calibrating(lua_State* L)
@@ -174,6 +224,10 @@ int Hook_setStereoRendering(lua_State* L)
         {"getView", L_getView},
         {"isRunning", L_isRunning},
         {"hudPanel", L_hudPanel},
+        {"setHudPanelCount", L_setHudPanelCount},
+        {"setHudPanel", L_setHudPanel},
+        {"headPose", L_headPose},
+        {"setCursorVisible", L_setCursorVisible},
         {"recenter", L_recenter},
         {"calibrating", L_calibrating},
         {"setSymmetric", L_setSymmetric},

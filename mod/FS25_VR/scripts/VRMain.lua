@@ -28,12 +28,13 @@ VRMod.KEY_FRUSTUM = Input.KEY_f6 or 287
 VRMod.KEY_HUD = Input.KEY_f10 or 291
 -- quad views: plane stereo plus a sharper focus view per eye (chosen in the settings)
 VRMod.quadViews = false
--- F11: VR settings (stereo mode: alternating eyes, plane stereo, quad views; 3D resolution)
+-- F11: VR settings (stereo mode: alternating eyes, plane stereo, quad views; 3D resolution; arrange
+-- the HUD). Shift+F10: arrange the HUD panels.
 VRMod.KEY_SETTINGS = Input.KEY_f11 or 292
 VRMod.STEREO_RETRY = 10000           -- ms between automatic plane stereo starts after a failure
--- With alternating eyes the HUD is drawn flat into each eye's image, so in the headset it sits in the
--- corners of your vision at screen depth: hidden there (F10 shows it again). In plane stereo the
--- bridge shows it as a panel in front of you instead (F10 hides it).
+-- The bridge shows the HUD as panels in the cab (F10 hides it). With hudPanel=0 in fs25vr.ini it
+-- would be drawn flat into each eye's image, in the corners of your vision at screen depth: hidden
+-- there instead (F10 shows it again).
 VRMod.hideHud = true
 VRMod.hidePanel = false
 VRMod.symmetric = true
@@ -83,6 +84,7 @@ function VRMod:loadMap(name)
         return
     end
 
+    self.hudPanels = VRHud.new(api)
     self:installHooks()
     self:loadOffsets()
     if self.settings.renderScale ~= nil and set3dResolutionScaling ~= nil then
@@ -146,9 +148,9 @@ function VRMod:updateHud(inVr)
     end
 end
 
--- The bridge shows the HUD as a panel (plane stereo, hudPanel=1 in fs25vr.ini)
+-- The bridge shows the HUD as panels in the 3D view (hudPanel=1 in fs25vr.ini)
 function VRMod:hudPanelShown()
-    return self.planeStereo ~= nil and self.api ~= nil and self.api.hudPanel ~= nil and self.api.hudPanel()
+    return self.api ~= nil and self.api.hudPanel ~= nil and self.api.hudPanel()
 end
 
 function VRMod:restoreFrameLimiter()
@@ -170,6 +172,9 @@ function VRMod:deleteMap()
     self:restoreFrameLimiter()
     self:restoreSSAO()
     self:updateHud(false)
+    if self.hudPanels ~= nil then
+        self.hudPanels:reset()
+    end
     self:stopPlaneStereo()
     if self.offsetDirty then
         self:saveOffsets()
@@ -637,6 +642,13 @@ function VRMod:update(dt)
         self:updateSSAO()
     end
     self:updateHud(running and self:isStereoAllowed())
+    if self.hudPanels ~= nil then
+        local shown = running and self:isStereoAllowed() and self:hudPanelShown() and not VRMod.hidePanel
+        if not shown and self.hudPanels.editing then
+            self.hudPanels:setEditing(false)
+        end
+        self.hudPanels:update(dt, shown)
+    end
     self:updateOffset(dt)
     self:updatePlaneStereo(dt)
     -- the stereo mode chosen in the settings: plane stereo starts by itself once VR shows the 3D view
@@ -663,6 +675,9 @@ function VRMod:update(dt)
         self.messageTime = self.messageTime - dt
         if self.messageTime <= 0 then
             self.messageText = nil
+            if self.hudPanels ~= nil then
+                self.hudPanels:setMessage(false)
+            end
         end
     end
 end
@@ -680,7 +695,9 @@ function VRMod:draw()
         end
         self.markerFrame = nil
     end
-    if self.messageText ~= nil then
+    if self.hudPanels ~= nil then
+        self.hudPanels:draw(self.messageText)
+    elseif self.messageText ~= nil then
         setTextAlignment(RenderText.ALIGN_CENTER)
         setTextBold(true)
         renderText(0.5, 0.6, 0.025, self.messageText)
@@ -691,6 +708,9 @@ end
 
 function VRMod:keyEvent(unicode, sym, modifier, isDown)
     if self.api == nil then
+        return
+    end
+    if self.hudPanels ~= nil and self.hudPanels:keyEvent(sym, isDown) then
         return
     end
     if VRMod.OFFSET_KEYS[sym] ~= nil then
@@ -724,6 +744,10 @@ function VRMod:keyEvent(unicode, sym, modifier, isDown)
         if g_gui ~= nil and not g_gui:getIsGuiVisible() and g_gui.guis["VRSettingsDialog"] ~= nil then
             g_gui:showDialog("VRSettingsDialog")
         end
+    elseif sym == VRMod.KEY_HUD and self.hudPanels ~= nil and self.hudPanels:isDown(Input.KEY_lshift, Input.KEY_rshift) then
+        self:toggleHudArranging()
+    elseif sym == VRMod.KEY_HUD and self.hudPanels ~= nil and self.hudPanels.editing then
+        self.hudPanels:toggleShowHelp()
     elseif sym == VRMod.KEY_HUD then
         if self:hudPanelShown() then
             VRMod.hidePanel = not VRMod.hidePanel
@@ -893,6 +917,29 @@ function VRMod:updatePlaneStereo(dt)
 end
 
 function VRMod:mouseEvent(posX, posY, isDown, isUp, button)
+    if self.hudPanels ~= nil then
+        self.hudPanels:mouseEvent(posX, posY, isDown, isUp, button)
+    end
+end
+
+-- Shift+F10 / F11 menu: arrange the HUD panels (needs the panels: both eyes every frame)
+function VRMod:toggleHudArranging()
+    if self.hudPanels == nil then
+        return
+    end
+    if self.hudPanels.editing then
+        self.hudPanels:setEditing(false)
+        self:showMessage("HUD layout saved")
+    elseif not self:hudPanelShown() then
+        self:showMessage("HUD panels are off (hudPanel in fs25vr.ini)")
+    elseif VRMod.hidePanel then
+        self:showMessage("Show the HUD first (F10)")
+    elseif not (self.api.isRunning() and self:isStereoAllowed()) then
+        self:showMessage("Arrange the HUD in the 3D view in VR")
+    else
+        self.hudPanels:setEditing(true)
+        self:showMessage("Arranging the HUD (Shift+F10: done)")
+    end
 end
 
 function VRMod:showMessage(text, quiet)
@@ -901,6 +948,9 @@ function VRMod:showMessage(text, quiet)
     end
     self.messageText = text
     self.messageTime = 2500
+    if self.hudPanels ~= nil then
+        self.hudPanels:setMessage(true)
+    end
 end
 
 addModEventListener(VRMod)

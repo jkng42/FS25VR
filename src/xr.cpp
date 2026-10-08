@@ -159,6 +159,20 @@ struct State {
     XrPosef        recenter{{0, 0, 0, 1}, {0, 0, 0}};
     bool           recenterPending = true;
 
+    // HUD panels from the Lua mod (count -1: the whole HUD at the configured default place)
+    struct HudPanel {
+        float   uv[4] = {0, 0, 1, 1};
+        XrPosef pose{{0, 0, 0, 1}, {0, 0, -1}};  // recentred tracking space
+        float   width = 1;
+        int     mark = 0;
+        int     flags = 0;
+    };
+    HudPanel       hudPanels[vr::kMaxHudPanels];
+    int            hudPanelCount = -1;
+    XrPosef        headRecentred{{0, 0, 0, 1}, {0, 0, 0}};  // newest view query, for arranging the panels
+    bool           headValid = false;
+    bool           cursorHidden = false;    // while arranging the HUD
+
     UINT           bbW = 0, bbH = 0;
     UINT           recW = 0, recH = 0;   // runtime's recommended per-eye resolution
 
@@ -850,10 +864,12 @@ bool CopyToChain(Chain& chain, ID3D12Resource* bb, DXGI_FORMAT bbFormat, bool sa
     return true;
 }
 
-// Plane stereo: the game's HUD (taken out of its image) as a panel in front of the head, drawn over
-// both eyes' staging images with each eye's own frustum and position, so it has real depth.
-void DrawHud(ID3D12Resource* hudImage, const XrPosef& leftPose, const XrFovf& leftFov, const XrPosef& rightPose,
-             const XrFovf& rightFov)
+// The parts of the game's HUD (taken out of its image) as panels in recentred tracking space, drawn
+// over the eyes' staging images (both in plane stereo, the frame's eye with alternating eyes) with
+// each eye's own pose and frustum, so they stay put in the cab and have real depth. head: between
+// the eyes, for the panels that move with it.
+void DrawHud(ID3D12Resource* hudImage, int eyeMask, const XrPosef eyePose[2], const XrFovf eyeFov[2],
+             const XrPosef& head)
 {
     int a = S.allocIndex;
     S.allocIndex = (S.allocIndex + 1) % kAllocs;
@@ -864,29 +880,53 @@ void DrawHud(ID3D12Resource* hudImage, const XrPosef& leftPose, const XrFovf& le
     S.alloc[a]->Reset();
     S.cl->Reset(S.alloc[a], nullptr);
 
-    // eye positions in head space (both eyes are shown with the left eye's orientation)
-    XrVector3f d = {rightPose.position.x - leftPose.position.x, rightPose.position.y - leftPose.position.y,
-                    rightPose.position.z - leftPose.position.z};
-    d = QRot(QConj(leftPose.orientation), d);
     D3D12_RESOURCE_DESC hd = hudImage->GetDesc();
+    const float texAspect = (float)hd.Height / (float)hd.Width;
+    State::HudPanel whole;
+    whole.pose.position = {0, g_config.hudOffsetY, -g_config.hudDistance};
+    whole.width = g_config.hudWidth;
+    const bool useWhole = S.hudPanelCount < 0;
+    const int count = useWhole ? 1 : S.hudPanelCount;
     for (int e = 0; e < 2; e++) {
-        const XrFovf& fov = e ? rightFov : leftFov;
-        float s = e ? 0.5f : -0.5f;
-        PanelDraw p;
-        p.tanLeft = tanf(fov.angleLeft);
-        p.tanRight = tanf(fov.angleRight);
-        p.tanUp = tanf(fov.angleUp);
-        p.tanDown = tanf(fov.angleDown);
-        p.eye[0] = s * d.x;
-        p.eye[1] = s * d.y;
-        p.eye[2] = s * d.z;
-        p.x = 0;
-        p.y = g_config.hudOffsetY;
-        p.w = g_config.hudWidth;
-        p.h = g_config.hudWidth * (float)hd.Height / (float)hd.Width;
-        p.distance = g_config.hudDistance;
+        if (!(eyeMask & (1 << e))) continue;
+        XrPosef toEye = PoseInverse(eyePose[e]);
         Chain& c = S.eyes[e];
-        S.blit.RecordPanel(S.cl, hudImage, hd.Format, c.stagingRtv[c.writeSet], c.w, c.h, p);
+        for (int i = 0; i < count; i++) {
+            const State::HudPanel& hp = useWhole ? whole : S.hudPanels[i];
+            float pw = hp.uv[2] - hp.uv[0], ph = hp.uv[3] - hp.uv[1];
+            if (pw <= 0 || ph <= 0 || hp.width <= 0) continue;
+            float halfW = 0.5f * hp.width, halfH = halfW * ph / pw * texAspect;
+            // panel in the eye's space: eye^-1 * recentre (or head) * panel
+            XrPosef inEye = PoseCompose(toEye, PoseCompose((hp.flags & vr::kHudHeadLocked) ? head : S.recenter, hp.pose));
+            XrVector3f u = QRot(inEye.orientation, {halfW, 0, 0});
+            XrVector3f v = QRot(inEye.orientation, {0, halfH, 0});
+            PanelDraw p;
+            p.tanLeft = tanf(eyeFov[e].angleLeft);
+            p.tanRight = tanf(eyeFov[e].angleRight);
+            p.tanUp = tanf(eyeFov[e].angleUp);
+            p.tanDown = tanf(eyeFov[e].angleDown);
+            p.centre[0] = inEye.position.x, p.centre[1] = inEye.position.y, p.centre[2] = inEye.position.z;
+            p.axisU[0] = u.x, p.axisU[1] = u.y, p.axisU[2] = u.z;
+            p.axisV[0] = v.x, p.axisV[1] = v.y, p.axisV[2] = v.z;
+            for (int k = 0; k < 4; k++) p.uv[k] = hp.uv[k];
+            if (hp.mark > 0) {
+                // arranging: outline and a light fill (white; looked at: yellow; held: green; selected:
+                // cyan); a plain area (crosshair): filled in the colour (mark 5: black)
+                static const float kColours[6][3] = {{0, 0, 0}, {1, 1, 1}, {1, 0.8f, 0.1f}, {0.2f, 1, 0.3f},
+                                                     {0.2f, 0.9f, 1}, {0, 0, 0}};
+                const float* col = kColours[std::min(hp.mark, 5)];
+                p.mark[0] = col[0], p.mark[1] = col[1], p.mark[2] = col[2];
+                p.mark[3] = hp.mark == 1 ? 0.6f : 0.9f;
+                p.border[0] = 0.005f / halfW, p.border[1] = 0.005f / halfH;
+                p.border[2] = hp.mark == 1 ? 0.12f : 0.2f;
+            }
+            if (hp.flags & vr::kHudSolid) {
+                p.mark[3] = 1;
+                p.border[2] = 1;
+                p.border[3] = 1;
+            }
+            S.blit.RecordPanel(S.cl, hudImage, hd.Format, c.stagingRtv[c.writeSet], c.w, c.h, p);
+        }
     }
     S.cl->Close();
     ID3D12CommandList* lists[] = {S.cl};
@@ -1126,7 +1166,7 @@ void CopyFrame(IDXGISwapChain* swap)
     if ((S.shouldRender || g_config.forceRender || S.async) && EnsureSwapchains(eyeW, eyeH, S.bbW, S.bbH)) {
         // the game draws the OS cursor, which is not part of the backbuffer; draw one into the copy
         CursorDraw cursor;
-        if (g_config.showCursor && CursorInBackbuffer(S.bbW, S.bbH, cursor.x, cursor.y)) {
+        if (g_config.showCursor && !S.cursorHidden && CursorInBackbuffer(S.bbW, S.bbH, cursor.x, cursor.y)) {
             cursor.visible = true;
             cursor.unit = std::max(1.0f, (float)S.bbH / 1080.0f * 1.25f);
         }
@@ -1190,7 +1230,15 @@ void CopyFrame(IDXGISwapChain* swap)
                                              fState[e], &rc);
                 }
                 if (okL && okR && okF) {
-                    if (ID3D12Resource* h = hud::FrameImage()) DrawHud(h, rec.pose, rec.fov, otherPose, rec.otherFov);
+                    if (ID3D12Resource* h = hud::FrameImage()) {
+                        const XrPosef poses[2] = {rec.pose, otherPose};
+                        const XrFovf fovs[2] = {rec.fov, rec.otherFov};
+                        XrPosef head = rec.pose;
+                        head.position = {0.5f * (rec.pose.position.x + otherPose.position.x),
+                                         0.5f * (rec.pose.position.y + otherPose.position.y),
+                                         0.5f * (rec.pose.position.z + otherPose.position.z)};
+                        DrawHud(h, 3, poses, fovs, head);
+                    }
                     int set = S.eyes[0].writeSet;
                     S.readySet = set;
                     S.readyPose[0] = rec.pose;
@@ -1202,6 +1250,18 @@ void CopyFrame(IDXGISwapChain* swap)
                 }
                 S.pairMask = 0;
             } else if (CopyToChain(S.eyes[rec.eye], bb, desc.Format, S.calibrating, m, &cursor)) {
+                if (ID3D12Resource* h = S.calibrating ? nullptr : hud::FrameImage()) {
+                    // alternating eyes: the head is half the eyes' distance to the side of this eye
+                    const XrPosef& v0 = S.pairViews[0].pose;
+                    const XrPosef& v1 = S.pairViews[1].pose;
+                    float dx = v1.position.x - v0.position.x, dy = v1.position.y - v0.position.y;
+                    float dz = v1.position.z - v0.position.z;
+                    float half = 0.5f * sqrtf(dx * dx + dy * dy + dz * dz);
+                    XrPosef head = PoseCompose(rec.pose, XrPosef{{0, 0, 0, 1}, {rec.eye ? -half : half, 0, 0}});
+                    XrPosef poses[2] = {rec.pose, rec.pose};
+                    XrFovf fovs[2] = {rec.fov, rec.fov};
+                    DrawHud(h, 1 << rec.eye, poses, fovs, head);
+                }
                 if (S.async) {  // the compositor submits complete pairs (and sets eyeValid/eyePose)
                     S.pairMask |= 1 << rec.eye;
                     S.pairPose[rec.eye] = rec.pose;
@@ -1231,7 +1291,8 @@ void CopyFrame(IDXGISwapChain* swap)
             else
                 S.quadValid = true;
         }
-        hud::SetActive(g_config.hudPanel && stereo && S.planeStereo && S.async);
+        // (not while measuring the latency: the marker it reads is drawn into the HUD)
+        hud::SetActive(g_config.hudPanel && stereo && S.async && !S.calibrating);
         S.showStereo = stereo;
         S.lastWasStereo = stereo;
         if (!stereo) S.mirrorValid = false;
@@ -1684,6 +1745,13 @@ bool GetView(EyeView& out)
         S.pairViewFrame = target;
     }
 
+    XrPosef head = views[0].pose;
+    head.position = {0.5f * (views[0].pose.position.x + views[1].pose.position.x),
+                     0.5f * (views[0].pose.position.y + views[1].pose.position.y),
+                     0.5f * (views[0].pose.position.z + views[1].pose.position.z)};
+    S.headRecentred = PoseCompose(PoseInverse(S.recenter), head);
+    S.headValid = true;
+
     FrameRecord& rec = S.ring[target % kRing];
     rec.frame = target;
     rec.eye = eye;
@@ -1804,6 +1872,45 @@ void HeadsetInfo(uint32_t& recW, uint32_t& recH, float& focusW, float& focusH)
     recH = S.recH;
     focusW = g_config.quadFocusWidth;
     focusH = g_config.quadFocusHeight;
+}
+
+void SetHudPanelCount(int n)
+{
+    std::lock_guard<std::recursive_mutex> lock(S.mtx);
+    S.hudPanelCount = std::min(n, kMaxHudPanels);
+}
+
+void SetCursorVisible(bool on)
+{
+    std::lock_guard<std::recursive_mutex> lock(S.mtx);
+    S.cursorHidden = !on;
+}
+
+void SetHudPanel(int i, const float uv[4], const float pos[3], float yaw, float pitch, float width, int mark,
+                 int flags)
+{
+    if (i < 0 || i >= kMaxHudPanels) return;
+    std::lock_guard<std::recursive_mutex> lock(S.mtx);
+    State::HudPanel& p = S.hudPanels[i];
+    for (int k = 0; k < 4; k++) p.uv[k] = uv[k];
+    p.pose.position = {pos[0], pos[1], pos[2]};
+    // yaw about +y, then pitch about the panel's own x axis
+    XrQuaternionf qy = {0, sinf(0.5f * yaw), 0, cosf(0.5f * yaw)};
+    XrQuaternionf qx = {sinf(0.5f * pitch), 0, 0, cosf(0.5f * pitch)};
+    p.pose.orientation = QMul(qy, qx);
+    p.width = width;
+    p.mark = mark;
+    p.flags = flags;
+}
+
+bool HeadPose(float pos[3], float quat[4])
+{
+    std::lock_guard<std::recursive_mutex> lock(S.mtx);
+    if (!S.headValid) return false;
+    const XrPosef& h = S.headRecentred;
+    pos[0] = h.position.x, pos[1] = h.position.y, pos[2] = h.position.z;
+    quat[0] = h.orientation.x, quat[1] = h.orientation.y, quat[2] = h.orientation.z, quat[3] = h.orientation.w;
+    return true;
 }
 
 void RequestRecenter()

@@ -80,15 +80,18 @@ float4 ps(V i) : SV_Target
 }
 )";
 
-// A flat panel in front of the eye (the game's HUD placed in 3D): every target pixel's ray from the
-// eye is intersected with the panel's plane, so both eyes see it at its real distance.
+// A flat panel in space (a part of the game's HUD): every target pixel's ray from the eye is
+// intersected with the panel's plane, so both eyes see it where it is.
 static const char* kPanelShader = R"(
 cbuffer C : register(b0)
 {
     float4 tans;     // tangents of the eye image's frustum: left, right, up, down
-    float4 eyeDec;   // eye position in head space (x, y, z), target is sRGB
-    float4 panel;    // panel centre (x, y) and half size (w, h) in head space, on the plane z = -dist
-    float4 misc;     // dist, unused, target size (w, h)
+    float4 centre;   // panel centre in eye space (x, y, z), target width
+    float4 axisU;    // half the panel's width along its rightward axis (eye space), target height
+    float4 axisV;    // half its height along its upward axis, target is sRGB
+    float4 uvRect;   // the part of the source it shows: u0, v0, u1, v1
+    float4 mark;     // outline colour and strength (arranging; 0 = none)
+    float4 border;   // outline width (share of the half width, half height), fill strength, plain area
 };
 Texture2D<float4> src : register(t0);
 SamplerState smp : register(s0);
@@ -110,16 +113,29 @@ float3 LinearToSrgb(float3 c)
 
 float4 ps(V i) : SV_Target
 {
-    float2 t = i.pos.xy / misc.zw;
-    float2 dir = float2(lerp(tans.x, tans.y, t.x), lerp(tans.z, tans.w, t.y));
-    float2 p = eyeDec.xy + (misc.x + eyeDec.z) * dir;
-    float2 uv = float2((p.x - panel.x) / (2 * panel.z) + 0.5, 0.5 - (p.y - panel.y) / (2 * panel.w));
-    if (any(uv < 0) || any(uv > 1)) discard;
+    float2 t = i.pos.xy / float2(centre.w, axisU.w);
+    float3 dir = float3(lerp(tans.x, tans.y, t.x), lerp(tans.z, tans.w, t.y), -1);
+    float3 n = cross(axisU.xyz, axisV.xyz);
+    float d = dot(dir, n);
+    if (abs(d) < 1e-8) discard;
+    float k = dot(centre.xyz, n) / d;
+    if (!(k > 0)) discard;
+    float3 p = k * dir - centre.xyz;
+    float2 ab = float2(dot(p, axisU.xyz) / dot(axisU.xyz, axisU.xyz), dot(p, axisV.xyz) / dot(axisV.xyz, axisV.xyz));
+    if (!all(abs(ab) <= 1)) discard;  // also drops NaN
+    float2 uv = lerp(uvRect.xy, uvRect.zw, float2(ab.x * 0.5 + 0.5, 0.5 - ab.y * 0.5));
     // the game's HUD: sRGB view (linear values), premultiplied colours, alpha = how much of the scene
     // shows through
     float4 c = src.SampleLevel(smp, uv, 0);
     c.a = 1 - c.a;
-    if (eyeDec.w < 0.5) c.rgb = c.a > 0 ? LinearToSrgb(saturate(c.rgb / c.a)) * c.a : float3(0, 0, 0);
+    if (border.w > 0.5) c = 0;  // a plain area in the mark's colour
+    if (mark.a > 0) {
+        // arranging: an outline, and a light fill under the HUD so empty panels can be seen
+        bool edge = abs(ab.x) > 1 - border.x || abs(ab.y) > 1 - border.y;
+        float a = mark.a * (edge ? 1 : border.z);
+        c = c + float4(mark.rgb * a, a) * (1 - c.a);
+    }
+    if (axisV.w < 0.5) c.rgb = c.a > 0 ? LinearToSrgb(saturate(c.rgb / c.a)) * c.a : float3(0, 0, 0);
     return c;
 }
 )";
@@ -170,7 +186,7 @@ bool Blitter::Init(ID3D12Device* device, DXGI_FORMAT dstFormat)
     range.NumDescriptors = 1;
     D3D12_ROOT_PARAMETER params[2] = {};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    params[0].Constants.Num32BitValues = 16;
+    params[0].Constants.Num32BitValues = 28;
     params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     params[1].DescriptorTable.NumDescriptorRanges = 1;
@@ -246,7 +262,7 @@ bool Blitter::Init(ID3D12Device* device, DXGI_FORMAT dstFormat)
 
     D3D12_DESCRIPTOR_HEAP_DESC hd = {};
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    hd.NumDescriptors = 16;
+    hd.NumDescriptors = kSrvRing;
     hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     if (FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&m_srvHeap)))) {
         Log("blit: CreateDescriptorHeap failed");
@@ -268,12 +284,21 @@ void Blitter::Shutdown()
 
 D3D12_GPU_DESCRIPTOR_HANDLE Blitter::SrvFor(ID3D12Resource* src, DXGI_FORMAT srcFormat)
 {
-    // Ring of 16 descriptors; at most a few blits are in flight at once.
-    UINT slot = m_srvNext++ % 16;
+    // A ring of descriptors, never rewritten while a recorded draw may still read it: up to kAllocs
+    // command lists in flight, each with a few blits and one view of the HUD for all its panels.
+    // The same source as the last call reuses the last view.
+    if (src == m_srvLastRes && srcFormat == m_srvLastFormat && m_srvNext) {
+        D3D12_GPU_DESCRIPTOR_HANDLE gpu = m_srvHeap->GetGPUDescriptorHandleForHeapStart();
+        gpu.ptr += (UINT64)((m_srvNext - 1) % kSrvRing) * m_srvInc;
+        return gpu;
+    }
+    UINT slot = m_srvNext++ % kSrvRing;
     D3D12_CPU_DESCRIPTOR_HANDLE cpu = m_srvHeap->GetCPUDescriptorHandleForHeapStart();
     D3D12_GPU_DESCRIPTOR_HANDLE gpu = m_srvHeap->GetGPUDescriptorHandleForHeapStart();
     cpu.ptr += (SIZE_T)slot * m_srvInc;
     gpu.ptr += (UINT64)slot * m_srvInc;
+    m_srvLastRes = src;
+    m_srvLastFormat = srcFormat;
 
     D3D12_SHADER_RESOURCE_VIEW_DESC sd = {};
     sd.Format = srcFormat;
@@ -288,14 +313,17 @@ void Blitter::RecordPanel(ID3D12GraphicsCommandList* cl, ID3D12Resource* src, DX
                           D3D12_CPU_DESCRIPTOR_HANDLE rtv, UINT dstW, UINT dstH, const PanelDraw& p)
 {
     D3D12_GPU_DESCRIPTOR_HANDLE gpu = SrvFor(src, srcFormat);
-    float consts[16] = {p.tanLeft, p.tanRight, p.tanUp, p.tanDown,
-                        p.eye[0], p.eye[1], p.eye[2], m_decodeSrgb ? 1.0f : 0.0f,
-                        p.x, p.y, 0.5f * p.w, 0.5f * p.h,
-                        p.distance, 0, (float)dstW, (float)dstH};
+    float consts[28] = {p.tanLeft, p.tanRight, p.tanUp, p.tanDown,
+                        p.centre[0], p.centre[1], p.centre[2], (float)dstW,
+                        p.axisU[0], p.axisU[1], p.axisU[2], (float)dstH,
+                        p.axisV[0], p.axisV[1], p.axisV[2], m_decodeSrgb ? 1.0f : 0.0f,
+                        p.uv[0], p.uv[1], p.uv[2], p.uv[3],
+                        p.mark[0], p.mark[1], p.mark[2], p.mark[3],
+                        p.border[0], p.border[1], p.border[2], p.border[3]};
     cl->SetGraphicsRootSignature(m_root);
     cl->SetPipelineState(m_psoPanel);
     cl->SetDescriptorHeaps(1, &m_srvHeap);
-    cl->SetGraphicsRoot32BitConstants(0, 16, consts, 0);
+    cl->SetGraphicsRoot32BitConstants(0, 28, consts, 0);
     cl->SetGraphicsRootDescriptorTable(1, gpu);
     D3D12_VIEWPORT vp = {0, 0, (float)dstW, (float)dstH, 0, 1};
     D3D12_RECT sc = {0, 0, (LONG)dstW, (LONG)dstH};

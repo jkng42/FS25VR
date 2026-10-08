@@ -29,6 +29,8 @@
         <BoxLayout profile="vr_buttons">
             <Button profile="buttonBack" id="backButton" text="$l10n_button_back" onClick="onClickBack"/>
             <Bitmap profile="vr_buttonGap"/>
+            <Button profile="buttonActivate" id="hudButton" onClick="onClickArrangeHud"/>
+            <Bitmap profile="vr_buttonGap"/>
             <Button profile="buttonOK" id="okButton" text="$l10n_button_ok" onClick="onClickOk"/>
         </BoxLayout>
     </GuiElement>
