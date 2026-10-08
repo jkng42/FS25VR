@@ -13,6 +13,7 @@
 #include "overlay.h"
 #include "planes.h"
 #include "log.h"
+#include "hud.h"
 #include "profile.h"
 #include "window.h"
 
@@ -849,6 +850,51 @@ bool CopyToChain(Chain& chain, ID3D12Resource* bb, DXGI_FORMAT bbFormat, bool sa
     return true;
 }
 
+// Plane stereo: the game's HUD (taken out of its image) as a panel in front of the head, drawn over
+// both eyes' staging images with each eye's own frustum and position, so it has real depth.
+void DrawHud(ID3D12Resource* hudImage, const XrPosef& leftPose, const XrFovf& leftFov, const XrPosef& rightPose,
+             const XrFovf& rightFov)
+{
+    int a = S.allocIndex;
+    S.allocIndex = (S.allocIndex + 1) % kAllocs;
+    if (S.fence->GetCompletedValue() < S.allocFence[a]) {
+        S.fence->SetEventOnCompletion(S.allocFence[a], S.fenceEvent);
+        WaitForSingleObject(S.fenceEvent, 1000);
+    }
+    S.alloc[a]->Reset();
+    S.cl->Reset(S.alloc[a], nullptr);
+
+    // eye positions in head space (both eyes are shown with the left eye's orientation)
+    XrVector3f d = {rightPose.position.x - leftPose.position.x, rightPose.position.y - leftPose.position.y,
+                    rightPose.position.z - leftPose.position.z};
+    d = QRot(QConj(leftPose.orientation), d);
+    D3D12_RESOURCE_DESC hd = hudImage->GetDesc();
+    for (int e = 0; e < 2; e++) {
+        const XrFovf& fov = e ? rightFov : leftFov;
+        float s = e ? 0.5f : -0.5f;
+        PanelDraw p;
+        p.tanLeft = tanf(fov.angleLeft);
+        p.tanRight = tanf(fov.angleRight);
+        p.tanUp = tanf(fov.angleUp);
+        p.tanDown = tanf(fov.angleDown);
+        p.eye[0] = s * d.x;
+        p.eye[1] = s * d.y;
+        p.eye[2] = s * d.z;
+        p.x = 0;
+        p.y = g_config.hudOffsetY;
+        p.w = g_config.hudWidth;
+        p.h = g_config.hudWidth * (float)hd.Height / (float)hd.Width;
+        p.distance = g_config.hudDistance;
+        Chain& c = S.eyes[e];
+        S.blit.RecordPanel(S.cl, hudImage, hd.Format, c.stagingRtv[c.writeSet], c.w, c.h, p);
+    }
+    S.cl->Close();
+    ID3D12CommandList* lists[] = {S.cl};
+    S.queue->ExecuteCommandLists(1, lists);
+    S.allocFence[a] = ++S.fenceValue;
+    S.queue->Signal(S.fence, S.allocFence[a]);
+}
+
 // Frustum that the game renders for an eye given the backbuffer aspect, plus the matching
 // setFovY / setProjectionOffset parameters. GIANTS builds its projection as
 //   t = tan(fovY/2), w = t*aspect, left/right = 2w*offX -/+ w, bottom/top = 2t*offY -/+ t
@@ -1030,6 +1076,7 @@ void OnSwapChainCreated(ID3D12CommandQueue* queue, IDXGISwapChain* swap)
     }
     Log("swap chain created (queue %p, device %p)", queue, dev);
     overlay::Install(dev);
+    hud::Install(dev);
     prof::Init(dev, queue);
     prof::HookQueue(queue);
 }
@@ -1143,6 +1190,7 @@ void CopyFrame(IDXGISwapChain* swap)
                                              fState[e], &rc);
                 }
                 if (okL && okR && okF) {
+                    if (ID3D12Resource* h = hud::FrameImage()) DrawHud(h, rec.pose, rec.fov, otherPose, rec.otherFov);
                     int set = S.eyes[0].writeSet;
                     S.readySet = set;
                     S.readyPose[0] = rec.pose;
@@ -1183,6 +1231,7 @@ void CopyFrame(IDXGISwapChain* swap)
             else
                 S.quadValid = true;
         }
+        hud::SetActive(g_config.hudPanel && stereo && S.planeStereo && S.async);
         S.showStereo = stereo;
         S.lastWasStereo = stereo;
         if (!stereo) S.mirrorValid = false;

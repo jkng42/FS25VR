@@ -31,9 +31,11 @@ VRMod.quadViews = false
 -- F11: VR settings (stereo mode: alternating eyes, plane stereo, quad views; 3D resolution)
 VRMod.KEY_SETTINGS = Input.KEY_f11 or 292
 VRMod.STEREO_RETRY = 10000           -- ms between automatic plane stereo starts after a failure
--- The HUD is drawn flat into each eye's image, so in the headset it sits in the corners of your
--- vision at screen depth. Hidden while the 3D view is in VR (F10 shows it again).
+-- With alternating eyes the HUD is drawn flat into each eye's image, so in the headset it sits in the
+-- corners of your vision at screen depth: hidden there (F10 shows it again). In plane stereo the
+-- bridge shows it as a panel in front of you instead (F10 hides it).
 VRMod.hideHud = true
+VRMod.hidePanel = false
 VRMod.symmetric = true
 
 -- Ambient occlusion: quality 1 ("Low") is SAO, a purely spatial pass; quality 2 and up is XeGTAO.
@@ -128,7 +130,11 @@ function VRMod:updateHud(inVr)
     if hud == nil or hud.setIsVisible == nil then
         return
     end
-    if inVr and VRMod.hideHud then
+    local hide = VRMod.hideHud
+    if self:hudPanelShown() then
+        hide = VRMod.hidePanel
+    end
+    if inVr and hide then
         local visible = hud.getIsVisible == nil or hud:getIsVisible()
         if not self.hudHidden and visible then
             hud:setIsVisible(false)
@@ -138,6 +144,11 @@ function VRMod:updateHud(inVr)
         hud:setIsVisible(true)
         self.hudHidden = false
     end
+end
+
+-- The bridge shows the HUD as a panel (plane stereo, hudPanel=1 in fs25vr.ini)
+function VRMod:hudPanelShown()
+    return self.planeStereo ~= nil and self.api ~= nil and self.api.hudPanel ~= nil and self.api.hudPanel()
 end
 
 function VRMod:restoreFrameLimiter()
@@ -714,8 +725,13 @@ function VRMod:keyEvent(unicode, sym, modifier, isDown)
             g_gui:showDialog("VRSettingsDialog")
         end
     elseif sym == VRMod.KEY_HUD then
-        VRMod.hideHud = not VRMod.hideHud
-        self:showMessage(VRMod.hideHud and "HUD hidden in VR" or "HUD shown in VR")
+        if self:hudPanelShown() then
+            VRMod.hidePanel = not VRMod.hidePanel
+            self:showMessage(VRMod.hidePanel and "HUD panel hidden" or "HUD panel shown")
+        else
+            VRMod.hideHud = not VRMod.hideHud
+            self:showMessage(VRMod.hideHud and "HUD hidden in VR" or "HUD shown in VR")
+        end
     elseif sym == VRMod.KEY_SSAO then
         VRMod.forceSAO = not VRMod.forceSAO
         self:showMessage(VRMod.forceSAO and "Ambient occlusion: SAO" or "Ambient occlusion: game setting")

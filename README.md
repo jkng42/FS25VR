@@ -11,7 +11,7 @@ fs25vr turns Farming Simulator 25 into a real VR game through OpenXR. It works w
 - **Synchronised eyes.** The simulation holds still between the left and right image of a pair, so moving vehicles and turning stay solid.
 - **Both eyes every frame (optional).** The engine renders the second eye in the same frame, with full lighting, shadows and mirrors. With **quad views** it also renders a sharper view of the middle of each eye. Chosen in the settings menu (F11).
 - **Comfortable menus.** Menus, the map and the shop appear on a flat screen in front of you, with a visible mouse pointer.
-- **HUD hidden in VR** (F10 brings it back). Your desktop window stays usable and can be larger than your monitor.
+- **HUD at real depth.** With both eyes every frame, the game's HUD (mods' HUDs included) is a panel in front of you, the same in both eyes. With alternating eyes it is hidden (F10 brings it back). Your desktop window stays usable and can be larger than your monitor.
 
 ## Requirements
 
@@ -69,7 +69,7 @@ The line below the settings shows what reaches the headset, as a multiple of its
 |---|---|
 | F8 | Recentre (sit or stand in your neutral position first) |
 | F9 | VR camera on/off (flat screen in the headset) |
-| F10 | HUD on/off in VR (hidden by default) |
+| F10 | HUD on/off in VR (panel shown by default with both eyes every frame; hidden by default with alternating eyes) |
 | F6 | Projection: centred (default) / exact off-centre |
 | F7 | Ambient occlusion: game setting (default) / force SAO |
 | F11 | VR settings: stereo mode (alternating eyes / both eyes every frame / both eyes + quad views) and 3D resolution. Saved, and applied whenever VR starts |
@@ -94,6 +94,8 @@ The head position offset is remembered separately for each vehicle's cab and for
 | `presentLag` | Starting guess for frame latency; measured automatically at VR start |
 | `quadFocusWidth`, `quadFocusHeight` | Quad views: share of each eye's field of view the focus view covers (default 0.5 x 0.45, centred) |
 | `quadFocusSmoothing` | Quad views: width of the focus view's soft edge (default 0.18, 0 = hard edge) |
+| `hudPanel` | 1 (default): with both eyes every frame, the HUD is a panel in front of you instead of flat in the image |
+| `hudDistance`, `hudWidth`, `hudOffsetY` | Placement of the HUD panel (metres; default 1 m away, 1 m wide, centred) |
 | `profile`, `debugLog` | Diagnostics: GPU timing, a per-frame CSV, verbose logging |
 
 ## How it works
@@ -107,12 +109,14 @@ Eyes are rendered alternately by default: one game frame per eye. Each image goe
 
 With both eyes every frame, the bridge adds the right eye (and with quad views both focus views) as further views of the engine's own main render path, the way the engine supports several screens. Each view gets the whole pipeline: shadows, lights, mirrors, post-processing with its own history. The bridge lays each focus view over its eye's image with a soft edge and hands the headset one image per eye.
 
+The engine draws the whole HUD into a texture of its own and blends it over the image in its last pass. In this mode the bridge copies that texture out and empties it, then draws the copy into both eyes as a panel, each eye with its own perspective.
+
 ## Known limitations
 
 - **With alternating eyes, each eye updates at half the game's frame rate.** Head motion is smooth because the runtime re-aligns each eye to your head, but world motion updates at the per-eye rate. Both eyes every frame (F11) avoids this at a higher GPU cost.
 - **With alternating eyes, effects that blend in the previous frame** may show artefacts, because the previous frame belongs to the other eye. Frame generation, DLSS/DSR and TAA are the known ones.
 - **Both eyes every frame and quad views** are new and have only been tested on Linux (Proton) with WiVRn and a Quest 3.
-- **The HUD can't be shown on the desktop mirror while it's hidden in the headset.**
+- **The desktop window shows no HUD** while it is hidden in the headset or shown there as a panel.
 - **Multiplayer:** works if the server has the mod, but has had little testing.
 - **Game updates** can stop the bridge from finding the engine functions it needs. It then logs this and falls back to a flat screen; it won't crash.
 

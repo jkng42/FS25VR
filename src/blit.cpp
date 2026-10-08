@@ -80,6 +80,50 @@ float4 ps(V i) : SV_Target
 }
 )";
 
+// A flat panel in front of the eye (the game's HUD placed in 3D): every target pixel's ray from the
+// eye is intersected with the panel's plane, so both eyes see it at its real distance.
+static const char* kPanelShader = R"(
+cbuffer C : register(b0)
+{
+    float4 tans;     // tangents of the eye image's frustum: left, right, up, down
+    float4 eyeDec;   // eye position in head space (x, y, z), target is sRGB
+    float4 panel;    // panel centre (x, y) and half size (w, h) in head space, on the plane z = -dist
+    float4 misc;     // dist, unused, target size (w, h)
+};
+Texture2D<float4> src : register(t0);
+SamplerState smp : register(s0);
+
+struct V { float4 pos : SV_Position; };
+
+V vs(uint id : SV_VertexID)
+{
+    V o;
+    float2 uv = float2((id << 1) & 2, id & 2);
+    o.pos = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
+    return o;
+}
+
+float3 LinearToSrgb(float3 c)
+{
+    return c <= 0.0031308 ? c * 12.92 : 1.055 * pow(c, 1 / 2.4) - 0.055;
+}
+
+float4 ps(V i) : SV_Target
+{
+    float2 t = i.pos.xy / misc.zw;
+    float2 dir = float2(lerp(tans.x, tans.y, t.x), lerp(tans.z, tans.w, t.y));
+    float2 p = eyeDec.xy + (misc.x + eyeDec.z) * dir;
+    float2 uv = float2((p.x - panel.x) / (2 * panel.z) + 0.5, 0.5 - (p.y - panel.y) / (2 * panel.w));
+    if (any(uv < 0) || any(uv > 1)) discard;
+    // the game's HUD: sRGB view (linear values), premultiplied colours, alpha = how much of the scene
+    // shows through
+    float4 c = src.SampleLevel(smp, uv, 0);
+    c.a = 1 - c.a;
+    if (eyeDec.w < 0.5) c.rgb = c.a > 0 ? LinearToSrgb(saturate(c.rgb / c.a)) * c.a : float3(0, 0, 0);
+    return c;
+}
+)";
+
 bool IsSrgbFormat(DXGI_FORMAT f)
 {
     return f == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || f == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB ||
@@ -89,11 +133,11 @@ bool IsSrgbFormat(DXGI_FORMAT f)
 using PFN_D3DCompile = HRESULT(WINAPI*)(LPCVOID, SIZE_T, LPCSTR, const D3D_SHADER_MACRO*, ID3DInclude*, LPCSTR,
                                         LPCSTR, UINT, UINT, ID3DBlob**, ID3DBlob**);
 
-static ID3DBlob* Compile(PFN_D3DCompile compile, const char* entry, const char* target)
+static ID3DBlob* Compile(PFN_D3DCompile compile, const char* entry, const char* target, const char* source = kShader)
 {
     ID3DBlob* code = nullptr;
     ID3DBlob* err = nullptr;
-    HRESULT hr = compile(kShader, strlen(kShader), "fs25vr_blit", nullptr, nullptr, entry, target,
+    HRESULT hr = compile(source, strlen(source), "fs25vr_blit", nullptr, nullptr, entry, target,
                          D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &err);
     if (FAILED(hr)) {
         Log("blit: shader %s failed: %s", entry, err ? (const char*)err->GetBufferPointer() : "?");
@@ -118,14 +162,15 @@ bool Blitter::Init(ID3D12Device* device, DXGI_FORMAT dstFormat)
     }
     ID3DBlob* vs = Compile(compile, "vs", "vs_5_0");
     ID3DBlob* ps = Compile(compile, "ps", "ps_5_0");
-    if (!vs || !ps) return false;
+    ID3DBlob* panelPs = Compile(compile, "ps", "ps_5_0", kPanelShader);
+    if (!vs || !ps || !panelPs) return false;
 
     D3D12_DESCRIPTOR_RANGE range = {};
     range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
     range.NumDescriptors = 1;
     D3D12_ROOT_PARAMETER params[2] = {};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    params[0].Constants.Num32BitValues = 12;
+    params[0].Constants.Num32BitValues = 16;
     params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     params[1].DescriptorTable.NumDescriptorRanges = 1;
@@ -181,8 +226,19 @@ bool Blitter::Init(ID3D12Device* device, DXGI_FORMAT dstFormat)
         b.BlendOpAlpha = D3D12_BLEND_OP_ADD;
         hr = device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&m_psoBlend));
     }
+    if (SUCCEEDED(hr)) {
+        // the panel: premultiplied alpha over the target, the target's alpha kept
+        D3D12_RENDER_TARGET_BLEND_DESC& b = pd.BlendState.RenderTarget[0];
+        b.SrcBlend = D3D12_BLEND_ONE;
+        b.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+        b.SrcBlendAlpha = D3D12_BLEND_ZERO;
+        b.DestBlendAlpha = D3D12_BLEND_ONE;
+        pd.PS = {panelPs->GetBufferPointer(), panelPs->GetBufferSize()};
+        hr = device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&m_psoPanel));
+    }
     vs->Release();
     ps->Release();
+    panelPs->Release();
     if (FAILED(hr)) {
         Log("blit: CreateGraphicsPipelineState failed 0x%08x", hr);
         return false;
@@ -205,13 +261,12 @@ void Blitter::Shutdown()
 {
     if (m_pso) m_pso->Release(), m_pso = nullptr;
     if (m_psoBlend) m_psoBlend->Release(), m_psoBlend = nullptr;
+    if (m_psoPanel) m_psoPanel->Release(), m_psoPanel = nullptr;
     if (m_root) m_root->Release(), m_root = nullptr;
     if (m_srvHeap) m_srvHeap->Release(), m_srvHeap = nullptr;
 }
 
-void Blitter::Record(ID3D12GraphicsCommandList* cl, ID3D12Resource* src, DXGI_FORMAT srcFormat,
-                     D3D12_CPU_DESCRIPTOR_HANDLE rtv, UINT dstW, UINT dstH, const CursorDraw* cursor,
-                     const BlitRect* over)
+D3D12_GPU_DESCRIPTOR_HANDLE Blitter::SrvFor(ID3D12Resource* src, DXGI_FORMAT srcFormat)
 {
     // Ring of 16 descriptors; at most a few blits are in flight at once.
     UINT slot = m_srvNext++ % 16;
@@ -226,6 +281,36 @@ void Blitter::Record(ID3D12GraphicsCommandList* cl, ID3D12Resource* src, DXGI_FO
     sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     sd.Texture2D.MipLevels = 1;
     m_device->CreateShaderResourceView(src, &sd, cpu);
+    return gpu;
+}
+
+void Blitter::RecordPanel(ID3D12GraphicsCommandList* cl, ID3D12Resource* src, DXGI_FORMAT srcFormat,
+                          D3D12_CPU_DESCRIPTOR_HANDLE rtv, UINT dstW, UINT dstH, const PanelDraw& p)
+{
+    D3D12_GPU_DESCRIPTOR_HANDLE gpu = SrvFor(src, srcFormat);
+    float consts[16] = {p.tanLeft, p.tanRight, p.tanUp, p.tanDown,
+                        p.eye[0], p.eye[1], p.eye[2], m_decodeSrgb ? 1.0f : 0.0f,
+                        p.x, p.y, 0.5f * p.w, 0.5f * p.h,
+                        p.distance, 0, (float)dstW, (float)dstH};
+    cl->SetGraphicsRootSignature(m_root);
+    cl->SetPipelineState(m_psoPanel);
+    cl->SetDescriptorHeaps(1, &m_srvHeap);
+    cl->SetGraphicsRoot32BitConstants(0, 16, consts, 0);
+    cl->SetGraphicsRootDescriptorTable(1, gpu);
+    D3D12_VIEWPORT vp = {0, 0, (float)dstW, (float)dstH, 0, 1};
+    D3D12_RECT sc = {0, 0, (LONG)dstW, (LONG)dstH};
+    cl->RSSetViewports(1, &vp);
+    cl->RSSetScissorRects(1, &sc);
+    cl->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    cl->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    cl->DrawInstanced(3, 1, 0, 0);
+}
+
+void Blitter::Record(ID3D12GraphicsCommandList* cl, ID3D12Resource* src, DXGI_FORMAT srcFormat,
+                     D3D12_CPU_DESCRIPTOR_HANDLE rtv, UINT dstW, UINT dstH, const CursorDraw* cursor,
+                     const BlitRect* over)
+{
+    D3D12_GPU_DESCRIPTOR_HANDLE gpu = SrvFor(src, srcFormat);
 
     D3D12_RESOURCE_DESC srcDesc = src->GetDesc();
     float rx = over ? over->x : 0, ry = over ? over->y : 0;

@@ -131,6 +131,13 @@ int L_isRunning(lua_State* L)
     return 1;
 }
 
+// vr.hudPanel() -> the game's HUD is shown as a panel in 3D (plane stereo) instead of flat in the eyes
+int L_hudPanel(lua_State* L)
+{
+    PushBool(L, g_config.hudPanel);
+    return 1;
+}
+
 int L_calibrating(lua_State* L)
 {
     PushBool(L, vr::IsCalibrating());
@@ -166,6 +173,7 @@ int Hook_setStereoRendering(lua_State* L)
     static const struct { const char* name; lua_CFunction fn; } funcs[] = {
         {"getView", L_getView},
         {"isRunning", L_isRunning},
+        {"hudPanel", L_hudPanel},
         {"recenter", L_recenter},
         {"calibrating", L_calibrating},
         {"setSymmetric", L_setSymmetric},

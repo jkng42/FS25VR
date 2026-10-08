@@ -23,6 +23,12 @@ struct Config {
     float quadFocusWidth   = 0.5f;   // fraction of the eye's horizontal field of view (centred)
     float quadFocusHeight  = 0.45f;  // ... vertical
     float quadFocusSmoothing = 0.18f; // blended edge of the focus view (fraction of its size)
+    // HUD panel (plane stereo): the game's HUD taken out of the eyes' images and shown as a panel in
+    // front of the head (metres, head space)
+    bool  hudPanel        = true;
+    float hudDistance     = 1.0f;
+    float hudWidth        = 1.0f;
+    float hudOffsetY      = 0.0f;
 };
 
 extern Config g_config;

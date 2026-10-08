@@ -27,6 +27,7 @@ add_library(dinput8 SHARED
     src/blit.cpp
     src/window.cpp
     src/sync.cpp
+    src/hud.cpp
     src/profile.cpp
     src/dinput8.def
 )
